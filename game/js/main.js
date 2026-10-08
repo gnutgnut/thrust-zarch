@@ -293,7 +293,7 @@ function updateZarch(dt, inp) {
   const P = Z.pos;
   if (enemies.length === 0) {
     Z.waveT -= dt;
-    if (Z.waveT <= 0) { Z.wave++; const n = Math.min(2 + Z.wave, 9); for (let i = 0; i < n; i++) spawnEnemy(); Z.waveT = 3; say('WAVE ' + Z.wave, 1.5); }
+    if (Z.waveT <= 0) { Z.wave++; const n = Math.min(2 + Z.wave, 9); for (let i = 0; i < n; i++) spawnEnemy(); Z.waveT = 3; say('WAVE ' + Z.wave, 1.5); sfx.waveStart?.(Z.wave); }
   }
   let lm = 0;
   if (!Z.alive) {
@@ -387,7 +387,7 @@ function updateZarch(dt, inp) {
 
 function refuelAtBase() {
   sfx.dock(); sfx.engine(0);
-  if (G.fuel < 99) say('REFUELLED', 1.5);
+  if (G.fuel < 99) { say('REFUELLED', 1.5); sfx.refuel?.(); }
   G.fuel = 100;
 }
 
@@ -464,6 +464,7 @@ function updateThrust(dt, inp) {
   const L = T.lvl;
   if (!T.alive) { T.deadT -= dt; if (T.deadT <= 0 && !G.over) { G.fuel = 100; resetThrustShip(); } stepParts(T.parts, dt); return; }
   const thr = G.fuel > 0 ? Math.max(inp.thrK, inp.thrUp) : 0, rot = inp.x, beam = !!inp.beam;
+  if (beam !== T.beamOn) sfx.beam?.(beam && G.fuel > 0);
   T.thrOn = thr; T.beamOn = beam;
   sfx.engine(T.landed && thr < 0.05 ? 0 : thr);
   T.fireCd -= dt;
@@ -515,7 +516,7 @@ function updateThrust(dt, inp) {
     const bx = T.x - Math.sin(T.ang) * 3.5, by = T.y - Math.cos(T.ang) * 3.5;
     if (!pod.attached && Math.hypot(pod.x - bx, pod.y - by) < 4.5) { pod.attached = true; pod.len = Math.max(ROPE, Math.hypot(pod.x - T.x, pod.y - T.y)); pod.grace = 0; T.hadPod = true; addScore(500); sfx.pickup(); say('POD SECURED  -  GET OUT!', 2.5); }
     for (const tk of T.tanks) if (tk.fuel > 0 && Math.hypot(tk.x - bx, tk.y - by) < 4.5) {
-      const take = Math.min(tk.fuel, 30 * dt, 100 - G.fuel); tk.fuel -= take; G.fuel += take;
+      const take = Math.min(tk.fuel, 30 * dt, 100 - G.fuel); tk.fuel -= take; G.fuel += take; if (take > 0) sfx.refuel?.();
       tk.mesh.userData.bar.scale.y = Math.max(0.01, tk.fuel / tk.max);
       if (take > 0) emit(T.parts, tk.x, tk.y, 0, (T.x - tk.x) * 2, (T.y - tk.y) * 2, 0, 0.4, .3, 1, .5, 0);
     }
@@ -763,6 +764,10 @@ function frame(now) {
     stepParts(zParts, dt);
   } else if (G.state === 'title') { stepParts(zParts, dt); }
   updateCamsAndMeshes(dt, now / 1000);
+  sfx.setMood?.(smooth(0, 1, camB));
+  sfx.setIntensity?.(G.mode === 'zarch' ? clamp(enemies.length / 8, 0, 1) : clamp(T.tb.length / 4 + (T.pod && T.pod.attached ? 0.4 : 0), 0, 1));
+  if (G.state === 'play' && !menuPaused && G.fuel < 15 && G.fuel > 0) sfx.alarm?.();
+  if (menuPaused || G.state !== 'play') sfx.beam?.(false);
   updateHud();
   renderer.render(zScene, zCam);
   const ri = renderer.info.render;

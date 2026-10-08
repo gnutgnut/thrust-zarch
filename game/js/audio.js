@@ -211,7 +211,7 @@ class NodeSid {
     const v = s.v == null ? .3 : s.v, A = s.a || .002, D = s.d || .1, Sl = s.s || 0, R = s.r || .05, gate = Math.max(s.dur || 0, A);
     const end = t + (Sl > 0 ? gate + R : Math.min(gate + R, A + D * 1.3)) + .03;
     const g = c.createGain(), rec = { g, nodes: [g], srcs: [], end }; let dst = g;
-    if (s.ring && s.m) { const r = c.createGain(), mo = c.createOscillator(); r.gain.value = 0; mo.type = 'square'; mo.frequency.setValueAtTime(s.m, t); if (s.m1) mo.frequency.exponentialRampToValueAtTime(s.m1, t + (s.ft || .1)); mo.connect(r.gain); r.connect(dst); dst = r; rec.nodes.push(r, mo); rec.srcs.push(mo); }
+    if (s.ring && s.m) { const r = c.createGain(), mo = c.createOscillator(); r.gain.value = 0; mo.type = 'square'; mo.frequency.setValueAtTime(s.m, t); if (s.m1) mo.frequency.exponentialRampToValueAtTime(s.m1, t + (s.ft || .1)); mo.start(t); mo.stop(end); mo.connect(r.gain); r.connect(dst); dst = r; rec.nodes.push(r, mo); rec.srcs.push(mo); }
     if (s.fl) { const F = this.filt(s.fl, t); F.connect(dst); dst = F; rec.nodes.push(F); }
     const q = s.sw, segs = q ? [[s.w, s.f, s.f1, s.ft, 0, q.t], [q.w, q.f || s.f, q.f1, q.ft, q.t, 0]] : [[s.w, s.f, s.f1, s.ft, 0, 0]];
     let last = null;
@@ -325,7 +325,7 @@ export class Sfx {
   }
   _vol() {
     if (!this.ctx) return; const v = this.vol, t = this.ctx.currentTime;
-    this.out.gain.setTargetAtTime(.9 * v.master, t, .02); this.mg.gain.setTargetAtTime(.8 * v.music, t, .02); this.sg.gain.setTargetAtTime(v.sfx, t, .02);
+    this.out.gain.setTargetAtTime(.9 * v.master, t, .02); this.mg.gain.setTargetAtTime(.55 * v.music, t, .02); this.sg.gain.setTargetAtTime(v.sfx, t, .02);
   }
   setVolume(o = {}) { for (const k of ['master', 'music', 'sfx']) if (typeof o[k] === 'number') this.vol[k] = clamp(o[k]); this._vol(); }
   setQuality(l) { l = clamp(l | 0, 0, 2); if (l === this.q) return; this.q = l; if (this.ctx) this._build(); }
@@ -443,8 +443,8 @@ export class Sfx {
   }
   boom(big = 1) {
     const b = clamp(+big || 1, .2, 2.5), k = Math.min(b, 1.3);
-    this._fx({ w: N, f: 2600 * k, f1: 160, ft: .9 * b, a: 0, d: .9 * b, s: 0, dur: .9 * b, v: .5 * k, fl: { m: LP, c: 4000 * Math.min(b, 1.2), c1: 90, ct: .8 * b, q: .45 } });
-    this._fx({ w: T, f: 170, f1: 32, ft: .35 * b, a: 0, d: .4 * b, s: 0, dur: .4 * b, v: .6 * Math.min(1.2, b) });
+    this._fx({ w: N, f: 2600 * k, f1: 160, ft: .9 * b, a: 0, d: .9 * b, s: 0, dur: .9 * b, v: .45 * k, fl: { m: LP, c: 4000 * Math.min(b, 1.2), c1: 90, ct: .8 * b, q: .45 } });
+    this._fx({ w: T, f: 170, f1: 32, ft: .35 * b, a: 0, d: .4 * b, s: 0, dur: .4 * b, v: .5 * Math.min(1.2, b) });
   }
   hit() {
     this._fx({ w: N, f: 6000, f1: 800, ft: .15, a: 0, d: .15, s: 0, dur: .15, v: .35 });
