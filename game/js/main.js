@@ -5,6 +5,7 @@ import { Sfx } from './audio.js';
 import { createArmies } from './armies.js';
 import { createPipeline, retroUniforms, retroSnapGLSL, retroizeScene, fixDisplayShader } from './render.js';
 import { createPathTracer } from './pathtracer.js';
+import { createGpuFx, waterGLSL, waterUniforms } from './gpufx.js';
 import { settings, setSetting, applyPreset, onSettings, createDynRes, createFrameLimiter, createPerfOverlay, createSettingsMenu, runBenchmark } from './settings.js';
 
 const $ = id => document.getElementById(id);
@@ -167,9 +168,10 @@ sky.renderOrder = -10; zScene.add(sky);
 
 let TG = 2.5;
 const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMaterial({
-  uniforms: { ...retroUniforms, uFog: { value: zScene.fog.color }, uFogNear: { value: 120 }, uFogFar: { value: 380 }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
+  uniforms: { ...retroUniforms, ...waterUniforms, uFog: { value: zScene.fog.color }, uFogNear: { value: 120 }, uFogFar: { value: 380 }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
   vertexShader: `
     ${retroSnapGLSL}
+    ${waterGLSL}
     varying vec3 vW; varying float vRaw;
     float rawH(vec2 p){return 14.*sin(p.x*.035+1.3)*cos(p.y*.04)+9.*sin(p.x*.09+p.y*.07)+5.*sin(p.y*.13-p.x*.05)+2.5*sin(p.x*.31)*sin(p.y*.27)+8.;}
     void main(){
@@ -177,10 +179,11 @@ const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMater
       float h=mix(${PAD_H.toFixed(1)},rawH(w.xz),smoothstep(${BASE_R.toFixed(1)},60.,length(w.xz)));
       vec2 sd=max(abs(w.xz)-vec2(${STRIP_X.toFixed(1)},${STRIP_Z.toFixed(1)}),0.);
       h=mix(max(h,${PAD_H.toFixed(1)}),h,smoothstep(0.,14.,length(sd)));
-      vRaw=h; w.y=max(h,0.); vW=w.xyz;
+      vRaw=h; w.y=h>0.?h:waterHeight(w.xz); vW=w.xyz;
       gl_Position=retroSnap(projectionMatrix*viewMatrix*w);
     }`,
   fragmentShader: `
+    ${waterGLSL}
     varying vec3 vW; varying float vRaw; uniform vec3 uFog; uniform vec3 uSun; uniform float uFogNear, uFogFar;
     void main(){
       if(abs(vW.x)<${HOLE_X.toFixed(2)}&&abs(vW.z)<${HOLE_Z.toFixed(2)}) discard;
@@ -192,7 +195,8 @@ const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMater
       vec3 c=mix(land,rock,smoothstep(24.,38.,vW.y));
       c=mix(vec3(.78,.72,.45),c,smoothstep(0.,3.,vW.y));
       c*=l;
-      if(vRaw<=0.) c=mix(vec3(.04,.18,.5),vec3(.07,.25,.6),chk)*(.8+.2*n.y);
+      if(vRaw<=0.){ vec3 wn=waterNormal(vW.xz); float wl=max(dot(wn,normalize(uSun)),0.);
+        c=mix(vec3(.04,.18,.5),vec3(.07,.25,.6),chk)*(.7+.5*wl)+pow(wl,24.)*.35; c=mix(c,vec3(.92,.96,1.),waterFoam(vW.xz)*.8); }
       float d=length(vW.xz);
       if(d<${BASE_R.toFixed(1)}){ vec3 pc=vec3(.5,.52,.58)*l; if(d<8.5){float r=d/8.5; pc=mix(vec3(.15,.16,.2),vec3(.95,.8,.1),step(.5,fract(r*4.)))*l;} c=pc; }
       float fd=length((viewMatrix*vec4(vW,1.)).xyz);
@@ -268,7 +272,7 @@ const Z = {
 const armies = createArmies({
   scene: zScene, groundY, terrainH, BOUND, PAD_H, rnd, say, addScore, sfx,
   spawnBullet: b => zBullets.push(b),
-  explode: (p, k) => { explode(zParts, p.x, p.y, p.z, Math.round(20 + k * 30), 10 + k * 6, false); sfx.boom(Math.min(2, 0.5 + k * 0.4)); },
+  explode: (p, k) => { explode(zParts, p.x, p.y, p.z, Math.round(10 + k * 12), 10 + k * 6, false); fx.explosion(p, k); sfx.boom(Math.min(2, 0.5 + k * 0.4)); },
   homeHit: dmg => { G.homeHp = Math.max(0, G.homeHp - dmg * 4); },
 });
 armies.setDifficulty(0.7);
@@ -287,7 +291,7 @@ function killPlayerZ(why) {
   if (G.bench) return;
   if (!Z.alive) return;
   Z.alive = false; Z.deadT = 2.4; G.hull = 100; shipMesh.visible = false; shipShadow.visible = false;
-  explode(zParts, Z.pos.x, Z.pos.y, Z.pos.z, 120, 28, false); sfx.boom(1.2); sfx.engine(0);
+  explode(zParts, Z.pos.x, Z.pos.y, Z.pos.z, 40, 28, false); fx.explosion(Z.pos, 1.5); sfx.boom(1.2); sfx.engine(0);
   say(why, 2);
   G.lives--; if (G.lives < 0) gameOver();
 }
@@ -326,6 +330,7 @@ function updateZarch(dt, inp) {
     sfx.engine(Z.landed ? 0 : Z.throttle);
     if (Z.throttle > 0.1 && !Z.landed) {
       const d = new THREE.Vector3(Z.lean.x, 1, Z.lean.y).normalize();
+      const noz = P.clone().addScaledVector(d, -1), dn = d.clone().negate(); fx.exhaust(noz, dn, Z.throttle, Z.vel); fx.downwash(noz, dn, Z.throttle);
       for (let i = 0; i < 3; i++) emit(zParts, P.x - d.x, P.y - d.y, P.z - d.z, -d.x * 14 + Z.vel.x * 0.5 + rnd(-2, 2), -d.y * 14 + Z.vel.y * 0.5 + rnd(-2, 2), -d.z * 14 + Z.vel.z * 0.5 + rnd(-2, 2), 0.45, 1, 0.65, 0.2, 0);
     }
     for (const ax of ['x', 'z']) if (Math.abs(P[ax]) > BOUND) { P[ax] = Math.sign(P[ax]) * BOUND; Z.vel[ax] = 0; say('TURN BACK', 0.8); }
@@ -335,7 +340,7 @@ function updateZarch(dt, inp) {
       Z.aim.copy(f).addScaledVector(u, -u.dot(f)).normalize();   // ship nose direction
     }
     if (inp.fire && Z.fireCd <= 0) {
-      Z.fireCd = 0.14; sfx.shot();
+      Z.fireCd = 0.14; sfx.shot(); fx.muzzle(P.clone().addScaledVector(Z.aim, 2), Z.aim, Z.vel);
       const bv = Z.aim.clone().multiplyScalar(75).addScaledVector(Z.vel, 0.5);
       zBullets.push({ p: P.clone().addScaledVector(Z.aim, 2), v: bv, life: 1.8, own: true });
     }
@@ -352,7 +357,8 @@ function updateZarch(dt, inp) {
   for (let i = zBullets.length - 1; i >= 0; i--) {
     const b = zBullets[i]; b.life -= dt; b.v.y -= GRAV * 0.25 * dt; b.p.addScaledVector(b.v, dt);
     let dead = b.life <= 0 || b.p.y < groundY(b.p.x, b.p.z);
-    if (dead && b.life > 0) explode(zParts, b.p.x, b.p.y, b.p.z, 6, 6, false);
+    if (dead && b.life > 0) fx.impact(b.p);
+    else if (!dead && b.own) fx.trail(b.p.clone().addScaledVector(b.v, -dt), b.p);
     if (!dead && b.own) {
       if (armies.hitTest(b.p, 0.6, 1)) dead = true;
     } else if (!dead && !b.own && Z.alive && b.p.distanceTo(P) < 2.1) { dead = true; damagePlayer(b.dmg, 'SHOT DOWN'); }
@@ -394,6 +400,7 @@ function buildCave(visit) {
   for (const t of T.turrets) { t.mesh = makeTurret(); t.mesh.position.set(t.x, t.y, 0); caveDyn.add(t.mesh); }
   for (const t of T.tanks) { t.mesh = makeTank(); t.mesh.position.set(t.x, t.y, 0); caveDyn.add(t.mesh); }
   retroizeScene(caveGroup);
+  if (typeof fx !== 'undefined') fx.setCave({ solid: L.solid, W: L.W, H: L.H, cellSize: CS, origin: { x: -CAVE_OX * CS, y: CAVE_TOP - L.H * CS } });
   T.pod = { x: L.orb.x, y: L.orb.y, vx: 0, vy: 0, attached: false };
   T.bullets.length = 0; T.tb.length = 0; T.parts.length = 0; T.hadPod = false;
 }
@@ -431,7 +438,7 @@ function crashThrust(why) {
   if (G.bench) { T.vx = T.vy = 0; return; }
   if (!T.alive) return;
   T.alive = false; T.deadT = 2.2; shipMesh.visible = false;
-  explode(T.parts, T.x, T.y, 0, 90, 14, true); sfx.boom(1); sfx.engine(0); say(why, 2);
+  explode(T.parts, T.x, T.y, 0, 40, 14, true); fx.explosion(fxCave(T.x, T.y), 1.2); sfx.boom(1); sfx.engine(0); say(why, 2);
   G.lives--; if (G.lives < 0) gameOver();
 }
 function los(ax, ay, bx, by) {
@@ -488,6 +495,7 @@ function updateThrust(dt, inp) {
   if (T.landed) G.fuel = Math.min(100, G.fuel + 25 * dt);
   if (thr > 0.1) {
     const s = Math.sin(T.ang), c = Math.cos(T.ang);
+    { const noz = fxCave(T.x - s * 0.9, T.y - c * 0.9), dn = new THREE.Vector3(-s, -c, 0); fx.exhaust(noz, dn, thr, new THREE.Vector3(T.vx * CS, T.vy * CS, 0)); fx.downwash(noz, dn, thr); }
     for (let i = 0; i < 3; i++) emit(T.parts, T.x - s * 0.9, T.y - c * 0.9, 0, -s * 9 + T.vx * .3 + rnd(-1.5, 1.5), -c * 9 + T.vy * .3 + rnd(-1.5, 1.5), 0, 0.4, 1, .6, .15, 0);
   }
   G.fuel = Math.max(0, G.fuel - 3.4 * thr * dt);
@@ -505,9 +513,14 @@ function updateThrust(dt, inp) {
     const b = T.bullets[i]; b.life -= dt; b.x += b.vx * dt; b.y += b.vy * dt;
     let dead = b.life <= 0 || sol(b.x, b.y);
     if (!dead) for (const t of T.turrets) if (t.alive && Math.hypot(t.x - b.x, t.y - b.y) < 1.0) {
-      t.alive = false; t.mesh.visible = false; explode(T.parts, t.x, t.y, 0, 40, 9, true); sfx.boom(0.6); addScore(100); dead = true; break;
+      t.alive = false; t.mesh.visible = false; explode(T.parts, t.x, t.y, 0, 20, 9, true); fx.explosion(fxCave(t.x, t.y), 0.8); fx.caveLiquid({ x: t.x, y: t.y }, { x: 0, y: 1 }, 80, 'coolant'); sfx.boom(0.6); addScore(100); dead = true; break;
     }
-    if (dead) { if (b.life > 0) explode(T.parts, b.x, b.y, 0, 5, 4, true); T.bullets[i] = T.bullets[T.bullets.length - 1]; T.bullets.pop(); }
+    // shooting a fuel tank ruptures it: the fuel spills out as liquid and pools in the cave
+    if (!dead) for (const tk of T.tanks) if (tk.fuel > 0 && Math.hypot(tk.x - b.x, tk.y - b.y) < 1.1) {
+      fx.caveLiquid({ x: tk.x, y: tk.y + 0.4 }, { x: 0, y: 1.5 }, Math.round(5 * tk.fuel), 'fuel'); fx.explosion(fxCave(tk.x, tk.y), 0.5);
+      tk.fuel = 0; tk.mesh.userData.bar.scale.y = 0.01; sfx.boom(0.5); dead = true; break;
+    }
+    if (dead) { if (b.life > 0) fx.impact(fxCave(b.x, b.y)); T.bullets[i] = T.bullets[T.bullets.length - 1]; T.bullets.pop(); }
   }
   for (const t of T.turrets) {
     if (!t.alive) continue;
@@ -596,6 +609,9 @@ function updateHud() {
 // PS2-demake pipeline: low-res render, bloom, dither/colour-depth, scanlines. The path tracer plugs in as an override.
 const pipeline = createPipeline(renderer, { scene: zScene, camera: zCam });
 const tracer = createPathTracer(renderer);
+// GPU particles, water waves and cave liquid: most interactions push something in the world
+const fx = createGpuFx(renderer, zScene, { budget: settings.effects.particleBudget, waterRes: settings.effects.waterRes });
+const fxCave = (x, y) => caveToWorld(x, y, new THREE.Vector3());
 function resize() {
   const w = innerWidth, h = innerHeight; pipeline.resize(w, h); zCam.aspect = w / h; zCam.updateProjectionMatrix();
 }
@@ -648,6 +664,7 @@ function applySettings(s, path) {
   if (all || path.startsWith('world.drawDistance') || path.startsWith('world.terrainDetail')) rebuildTerrain();
   if (all || path.startsWith('world.drawDistance')) armies.setDrawDistance(s.world.drawDistance);
   if (all || /^(display|retro|pathTrace|world\.drawDistance)/.test(path)) applyRenderSettings();
+  if (all || path.startsWith('effects')) fx.setSettings(s.effects);
   if (all || path === 'world.trees') if (treeMesh) treeMesh.count = Math.round(treeTotal * s.world.trees);
   if (all || path.startsWith('audio')) { sfx.setVolume?.({ master: s.audio.master, music: s.audio.music, sfx: s.audio.sfx }); sfx.setQuality?.(s.audio.audioQuality); }
   $('dbg').style.display = s.display.showFps ? 'none' : '';
@@ -792,14 +809,15 @@ function frame(now) {
   if (G.state === 'play' && !menuPaused && G.fuel < 15 && G.fuel > 0) sfx.alarm?.();
   if (menuPaused || G.state !== 'play') sfx.beam?.(false);
   updateHud();
+  fx.update(dt, { camera: zCam, playerPos: Z.pos, inCave: G.mode === 'thrust' });
   pipeline.render(dt);
   const ri = pipeline.info();
-  perf.update(frameMs, { res: ri.res, scale: dynRes.scale, drawCalls: ri.drawCalls, triangles: ri.triangles });
+  perf.update(frameMs, { res: ri.res, scale: dynRes.scale, drawCalls: ri.drawCalls, triangles: ri.triangles, particles: fx.stats().alive });
 }
 buildCave(1); resetZarch(true); retroizeScene(zScene);
 fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(v => { if (v) $('gpuinfo').textContent += `  ·  build ${v.commit}${v.dirty ? '+' : ''} ${v.date}`; }).catch(() => {});
 requestAnimationFrame(frame);
-if (params.has('debug')) { window.__G = { G, Z, T, settings, setSetting, applyPreset, menu, benchHooks, runBenchmark, newGame, armies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
+if (params.has('debug')) { window.__G = { G, Z, T, settings, setSetting, applyPreset, menu, benchHooks, runBenchmark, newGame, armies, fx, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
     newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); G.icon = true; camB = 1;
     T.x = 10.2; T.y = 26.4; T.ang = -0.3; T.vx = T.vy = 0; T.thrOn = 1; T.beamOn = true; T.face = 1; T.roll = 0;
     Object.assign(T.pod, { x: 12.2, y: 21.9, attached: true, len: 4.2 }); G.state = 'icon';

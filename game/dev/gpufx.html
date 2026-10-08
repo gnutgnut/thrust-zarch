@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gpufx dev</title>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.min.js"}}</script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:Consolas,monospace;color:#9ff}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+#hud{position:fixed;left:10px;top:8px;font-size:13px;line-height:1.45;text-shadow:0 0 4px #000;white-space:pre;pointer-events:none}
+#keys{position:fixed;left:10px;bottom:8px;font-size:12px;color:#bdf;text-shadow:0 0 4px #000}
+</style></head><body>
+<canvas id="gl"></canvas>
+<div id="hud"></div>
+<div id="keys">1 surface &middot; 2 cave &middot; B cycle budget &middot; W water sim on/off &middot; E explosion &middot; query: ?scene=surface|cave&amp;budget=N&amp;waterRes=N&amp;fluid=N</div>
+<script type="module">
+import * as THREE from 'three';
+import { createGpuFx, waterGLSL, waterUniforms, terrainH, inHole, LIQUID } from '../js/gpufx.js';
+import { buildLevel } from '../js/level.js';
+import { buildCaveMesh } from '../js/cave3d.js';
+
+const Q = new URLSearchParams(location.search);
+let sceneMode = Q.get('scene') || 'surface';
+const PAD_H = 6, CAVE_TOP = PAD_H - 0.15, CS = 1.6, CAVE_OX = 32.5, HOLE_X = 5.6, HOLE_Z = 4.8;
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const HORIZON = new THREE.Color(0xbfd9f2);
+scene.fog = new THREE.Fog(HORIZON.clone(), 120, 380);
+scene.background = new THREE.Color(0x9cc4ea);
+const cam = new THREE.PerspectiveCamera(62, 1, 0.5, 1200);
+scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x4a5a34, 0.9));
+const sun = new THREE.DirectionalLight(0xfff0d0, 1.1); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+
+// ---- terrain (copy of main.js) + simulated water surface via waterGLSL
+const TG = 2.5, TN = 170;
+const tgeo = new THREE.PlaneGeometry(TG * TN, TG * TN, TN, TN); tgeo.rotateX(-Math.PI / 2);
+const terrain = new THREE.Mesh(tgeo, new THREE.ShaderMaterial({
+  uniforms: { ...waterUniforms, uFog: { value: HORIZON }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
+  vertexShader: `
+    ${waterGLSL}
+    varying vec3 vW; varying float vRaw;
+    float rawH(vec2 p){return 14.*sin(p.x*.035+1.3)*cos(p.y*.04)+9.*sin(p.x*.09+p.y*.07)+5.*sin(p.y*.13-p.x*.05)+2.5*sin(p.x*.31)*sin(p.y*.27)+8.;}
+    void main(){
+      vec4 w=modelMatrix*vec4(position,1.);
+      float h=mix(6.0,rawH(w.xz),smoothstep(18.0,60.,length(w.xz)));
+      vec2 sd=max(abs(w.xz)-vec2(76.0,9.0),0.);
+      h=mix(max(h,6.0),h,smoothstep(0.,14.,length(sd)));
+      vRaw=h; w.y=h>0.?h:waterHeight(w.xz); vW=w.xyz;
+      gl_Position=projectionMatrix*viewMatrix*w;
+    }`,
+  fragmentShader: `
+    ${waterGLSL}
+    varying vec3 vW; varying float vRaw; uniform vec3 uFog; uniform vec3 uSun;
+    void main(){
+      if(abs(vW.x)<${HOLE_X.toFixed(2)}&&abs(vW.z)<${HOLE_Z.toFixed(2)}) discard;
+      vec3 n=normalize(cross(dFdx(vW),dFdy(vW))); if(n.y<0.) n=-n;
+      float l=max(dot(n,normalize(uSun)),0.)*.75+.4;
+      vec2 g=floor(vW.xz/6.); float chk=mod(g.x+g.y,2.);
+      vec3 land=mix(vec3(.17,.5,.15),vec3(.25,.6,.19),chk);
+      vec3 rock=mix(vec3(.45,.37,.27),vec3(.52,.43,.32),chk);
+      vec3 c=mix(land,rock,smoothstep(24.,38.,vW.y));
+      c=mix(vec3(.78,.72,.45),c,smoothstep(0.,3.,vW.y));
+      c*=l;
+      if(vRaw<=0.){
+        vec3 wn=waterNormal(vW.xz); wn=normalize(vec3(wn.x*4.,wn.y,wn.z*4.));
+        vec3 V=normalize(cameraPosition-vW);
+        float fr=pow(1.-max(dot(wn,V),0.),3.);
+        float sp=pow(max(dot(reflect(-normalize(uSun),wn),V),0.),60.);
+        c=mix(vec3(.04,.18,.5),vec3(.07,.25,.6),chk)*(.45+.75*max(dot(wn,normalize(uSun)),0.))+fr*vec3(.35,.5,.7)+sp*.8;
+        c=mix(c,vec3(.92,.96,1.),waterFoam(vW.xz)*.85);
+      }
+      float fd=length((viewMatrix*vec4(vW,1.)).xyz);
+      gl_FragColor=vec4(mix(c,uFog,smoothstep(130.,370.,fd)),1.);
+    }`,
+}));
+terrain.frustumCulled = false; scene.add(terrain);
+
+// ---- cave (same placement as main.js)
+const L = buildLevel(1);
+const caveGroup = new THREE.Group(); caveGroup.scale.setScalar(CS); caveGroup.position.set(-CAVE_OX * CS, CAVE_TOP - L.H * CS, 0);
+caveGroup.add(buildCaveMesh(L, { depth: 6 })); scene.add(caveGroup);
+const caveToWorld = (x, y) => new THREE.Vector3((x - CAVE_OX) * CS, CAVE_TOP + (y - L.H) * CS, 0);
+
+// ---- ship proxy
+const ship = new THREE.Mesh(new THREE.ConeGeometry(1.1, 3, 4), new THREE.MeshPhongMaterial({ color: 0xd8dde8, flatShading: true }));
+scene.add(ship);
+
+// ---- fx
+const fx = createGpuFx(renderer, scene, {
+  budget: +(Q.get('budget') || 32768), waterRes: +(Q.get('waterRes') || 256), caveFluidRes: +(Q.get('fluid') || 8192),
+  waterSim: Q.get('water') !== '0', caveFluid: Q.get('fluid') !== '0',
+});
+fx.setCave({ solid: L.solid, W: L.W, H: L.H, cellSize: CS, origin: { x: -CAVE_OX * CS, y: CAVE_TOP - L.H * CS } });
+window.__fx = fx;
+// debug-only readbacks (never used per frame)
+const _h2f = h => { const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 31, m = h & 1023; return e === 0 ? s * m * 2 ** -24 : e === 31 ? s * Infinity : s * (1 + m / 1024) * 2 ** (e - 15); };
+window.__fluidStats = () => { const rt = fx._frt[fx._fi], b = new Float32Array(fx.FW * fx.FH * 4); renderer.readRenderTargetPixels(rt, 0, 0, fx.FW, fx.FH, b);
+  let alive = 0, inRock = 0, up = 0; const ex = []; for (let i = 0; i < fx.FN; i++) { if (b[i * 4 + 2] <= 0) continue; alive++; const x = b[i * 4], y = b[i * 4 + 1];
+  const s = y >= L.H ? 0 : (x < 0 || x >= L.W || y < 0) ? 1 : L.solid[Math.floor(y) * L.W + Math.floor(x)]; if (s) { inRock++; if (ex.length < 6) ex.push([x.toFixed(2), y.toFixed(2)]); } }
+  return { alive, inRock, ex }; };
+window.__fluidHist = () => { const rt = fx._frt[fx._fi], b = new Float32Array(fx.FW * fx.FH * 4); renderer.readRenderTargetPixels(rt, 0, 0, fx.FW, fx.FH, b);
+  const h = {}; const s = []; for (let i = 0; i < fx.FN; i++) { if (b[i * 4 + 2] <= 0) continue; const x = b[i * 4], y = b[i * 4 + 1]; if (x < 45 || x > 60) continue; const k = Math.floor(y); h[k] = (h[k] || 0) + 1; if (s.length < 5) s.push([x.toFixed(2), y.toFixed(2), b[i*4+2].toFixed(1), b[i*4+3]]); }
+  return { h, s }; };
+window.__waterStats = () => { const rt = fx._wrt[fx._wi], N = fx.WN, b = new Uint16Array(N * N * 4); renderer.readRenderTargetPixels(rt, 0, 0, N, N, b);
+  let mh = 0, mf = 0, nz = 0; for (let i = 0; i < N * N; i++) { const h = Math.abs(_h2f(b[i * 4])), f = _h2f(b[i * 4 + 2]); mh = Math.max(mh, h); mf = Math.max(mf, f); if (h > 0.01) nz++; } return { maxH: mh, maxFoam: mf, cells: nz }; };
+
+function resize() { renderer.setSize(innerWidth, innerHeight, false); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+const budgets = [4096, 16384, 65536, 262144];
+addEventListener('keydown', e => {
+  if (e.code === 'Digit1') setMode('surface');
+  if (e.code === 'Digit2') setMode('cave');
+  if (e.code === 'KeyB') { const i = (budgets.indexOf(fx.cfg.particleBudget) + 1) % budgets.length; fx.setSettings({ particleBudget: budgets[i] }); }
+  if (e.code === 'KeyW') fx.setSettings({ waterSim: !fx.cfg.waterSim });
+  if (e.code === 'KeyE') boomRandom();
+});
+
+// ---- scenario state
+let T = 0, nextBoom = 0.5, nextBolt = 0, nextFuel = 2;
+const bolts = [];
+function setMode(m) { sceneMode = m; T = 0; nextBoom = 0.5; }
+window.__dev = { setMode, get T() { return T; } };
+const shipPos = new THREE.Vector3(15, 10, 40), shipVel = new THREE.Vector3();
+const gY = (x, z) => inHole(x, z) ? -50 : Math.max(terrainH(x, z), 0);
+function boomRandom() {
+  if (sceneMode === 'cave') {
+    const spots = [[45.5, 32.4], [40, 36], [32, 30], [26, 38], [52.5, 41.2], [48, 35]];
+    const s = spots[Math.floor(Math.random() * spots.length)];
+    fx.explosion(caveToWorld(s[0], s[1]), rnd(0.6, 1.3));
+    if (Math.random() < 0.5) fx.caveLiquid({ x: s[0], y: s[1] }, { x: 0, y: 2 }, 50, LIQUID.coolant, { speed: 5, spread: 0.5 });
+  } else {
+    const k = Math.floor(Math.random() * 3);
+    const x = k === 0 ? rnd(8, 22) : rnd(-20, 40), z = k === 0 ? rnd(45, 62) : rnd(20, 70);
+    const y = gY(x, z) + (k === 2 ? rnd(6, 14) : rnd(0, 2));
+    fx.explosion({ x, y, z }, rnd(0.7, 1.6));
+  }
+}
+
+let last = performance.now(), fpsA = 0, fpsN = 0, fps = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05); last = now; T += dt;
+  fpsA += (now - (window.__lastNow || now)) / 1000; window.__lastNow = now; fpsN++; if (fpsA > 1) { fps = fpsN / fpsA; fpsA = 0; fpsN = 0; }
+  const inCave = sceneMode === 'cave';
+  if (T > nextBoom && !Q.has('nofx') && !Q.has('noboom')) { boomRandom(); nextBoom = T + (inCave ? 1.6 : 0.55); }
+  if (!inCave) {
+    // ship sweeps between land and lake, thrusting down
+    const tz = Q.has('shipz') ? +Q.get('shipz') : 40 + 16 * Math.sin(T * 0.4), tx = Q.has('shipz') ? 14 : 14 + 4 * Math.sin(T * 0.23);
+    const ty = gY(tx, tz) + 3.5 + 1.2 * Math.sin(T * 1.7);
+    const np = new THREE.Vector3(tx, ty, tz); shipVel.subVectors(np, shipPos).divideScalar(Math.max(dt, 1e-3)); shipPos.copy(np);
+    ship.position.copy(shipPos); ship.rotation.set(0, 0, 0);
+    const nozzle = shipPos.clone().add(new THREE.Vector3(0, -1.6, 0)), down = new THREE.Vector3(0, -1, 0);
+    fx.exhaust(nozzle, down, 0.9, shipVel);
+    fx.downwash(nozzle, down, 1);
+    // plasma bolts fired at the far shore
+    if (T > nextBolt && !Q.has('noboom')) {
+      nextBolt = T + 0.25;
+      const dir = new THREE.Vector3(rnd(-0.3, 0.3), -0.18, 1).normalize();
+      const p0 = shipPos.clone().addScaledVector(dir, 2);
+      fx.muzzle(p0, dir, shipVel);
+      bolts.push({ p: p0, v: dir.multiplyScalar(60), life: 2 });
+    }
+    for (let i = bolts.length - 1; i >= 0; i--) {
+      const b = bolts[i], p0 = b.p.clone(); b.life -= dt; b.v.y -= 2.2 * dt; b.p.addScaledVector(b.v, dt);
+      fx.trail(p0, b.p);
+      if (b.p.y < gY(b.p.x, b.p.z) || b.life < 0) { if (b.life > 0) fx.impact(b.p); bolts.splice(i, 1); }
+    }
+    if (T > nextFuel) { nextFuel = T + 2.5; fx.emit('fuel', { x: 12, y: 9, z: 55 }, { x: 0, y: 2, z: 0 }, 160, { speed: 4 }); }
+    // camera
+    cam.fov = 62; cam.updateProjectionMatrix();
+    if (Q.get('cam') === 'far') { cam.position.set(14, 34, 14); cam.lookAt(14, 0, 50); } else { cam.position.set(16, 15, 22); cam.lookAt(14, 1, 46); }
+    scene.fog.color.copy(HORIZON); scene.fog.near = 120;
+  } else {
+    // pour fuel into the east chamber basin and coolant into the main chamber (drains down the landing shaft)
+    if (T < 4) fx.caveLiquid({ x: 53, y: 40 }, { x: -1, y: -3 }, Math.max(1, Math.round(110 * dt)), LIQUID.fuel, { spread: 0.5 });
+    if (T > 2 && T < 5) fx.caveLiquid({ x: 30, y: 41 }, { x: 2, y: -2 }, Math.max(1, Math.round(90 * dt)), LIQUID.coolant, { spread: 0.5 });
+    const sx = 49 + 4 * Math.sin(T * 0.5), sy = 34.5 + 0.8 * Math.sin(T * 1.3);
+    const wp = caveToWorld(sx, sy); ship.position.copy(wp); ship.rotation.set(0, 0, 0);
+    const nozzle = wp.clone().add(new THREE.Vector3(0, -1.6, 0)), down = new THREE.Vector3(0, -1, 0);
+    const thr = Q.has('noship') ? 0 : T > 10 ? 1 : 0.3;
+    fx.exhaust(nozzle, down, thr);
+    fx.downwash(nozzle, down, thr);
+    const c = caveToWorld(41, 32);
+    cam.fov = 38; cam.updateProjectionMatrix();
+    cam.position.set(c.x, c.y, 24 * CS / Math.tan(19 * Math.PI / 180)); cam.lookAt(c.x, c.y, 0);
+    scene.fog.color.copy(HORIZON).multiplyScalar(0.15); scene.fog.near = 200;
+  }
+  terrain.position.set(Math.round(cam.position.x / TG) * TG, 0, Math.round(cam.position.z / TG) * TG);
+  if (!Q.has('nofx')) fx.update(dt, { camera: cam, playerPos: shipPos, inCave }); else fx.alphaMesh.visible = fx.addMesh.visible = false;
+  renderer.render(scene, cam);
+  const s = fx.stats();
+  document.getElementById('hud').textContent =
+    `gpufx dev - ${sceneMode}   ${fps.toFixed(0)} fps\n` +
+    `particles ~${s.alive} / ${s.budget}  (add ${s.additive}, alpha ${s.alpha})  float32=${s.float}\n` +
+    `liquid ~${s.liquid} / ${s.liquidBudget}   water ${s.waterRes ? s.waterRes + '^2' : 'off'}\n` +
+    `fx gpu ${s.ms == null ? 'n/a' : s.ms.toFixed(2) + ' ms'}  cpu ${s.cpuMs.toFixed(2)} ms`;
+}
+requestAnimationFrame(frame);
+window.__fps = () => fps;
+</script>
+</body></html>
