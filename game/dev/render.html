@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>render.js dev</title>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.min.js"}}</script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:Consolas,"Courier New",monospace;color:#9ff}
+canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+#ui{position:fixed;left:10px;top:10px;font-size:12px;background:rgba(0,10,20,.6);padding:8px;border:1px solid #2aa;max-width:330px}
+#ui button{font:11px Consolas,monospace;background:#032;color:#8fd;border:1px solid #2a8;margin:2px;padding:3px 5px;cursor:pointer}
+#ui button.off{background:#200;color:#c77;border-color:#844}
+#stats{white-space:pre;margin-top:6px;color:#cfe}
+#dbg{position:fixed;right:10px;top:10px;font-size:14px;color:#ff8}
+</style></head><body>
+<canvas id="gl"></canvas>
+<div id="ui"><div id="btns"></div><div id="stats"></div></div>
+<div id="dbg"></div>
+<script type="module">
+import * as THREE from 'three';
+import { createPipeline, retroizeScene, retroSnapGLSL, retroUniforms, applyDrawDistance, drawDistanceUniforms, DEFAULT_SETTINGS } from '../js/render.js';
+import { buildCaveMesh, makeTurret, makeTank, makePod } from '../js/cave3d.js';
+import { buildLevel } from '../js/level.js';
+
+const $ = id => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: false, powerPreference: 'high-performance' });
+const scene = new THREE.Scene();
+const HORIZON = new THREE.Color(0xbfd9f2);
+scene.fog = new THREE.Fog(HORIZON, 120, 380);
+const cam = new THREE.PerspectiveCamera(62, 1, 0.5, 1200);
+scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x4a5a34, 0.9));
+const sun = new THREE.DirectionalLight(0xfff0d0, 1.1); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+
+// sky (custom shader, same as the game)
+const sky = new THREE.Mesh(new THREE.SphereGeometry(900, 24, 12), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  vertexShader: 'varying vec3 vP; void main(){vP=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}',
+  fragmentShader: 'varying vec3 vP; void main(){float h=normalize(vP).y; vec3 hz=vec3(.75,.85,.95), zn=vec3(.22,.42,.85); gl_FragColor=vec4(mix(hz,zn,smoothstep(0.,.55,h)),1.);}',
+}));
+sky.renderOrder = -10; scene.add(sky);
+
+// ---- field: vertex-coloured hilly checker ground (Lambert, flat shaded)
+const H = (x, z) => 6 * Math.sin(x * .05) * Math.cos(z * .06) + 3 * Math.sin(x * .13 + z * .09);
+{
+  const g = new THREE.PlaneGeometry(500, 500, 100, 100).rotateX(-Math.PI / 2).toNonIndexed();
+  const p = g.attributes.position, col = [];
+  for (let i = 0; i < p.count; i++) p.setY(i, H(p.getX(i), p.getZ(i)));
+  for (let i = 0; i < p.count; i += 3) {
+    const cx = (p.getX(i) + p.getX(i + 1) + p.getX(i + 2)) / 3, cz = (p.getZ(i) + p.getZ(i + 1) + p.getZ(i + 2)) / 3;
+    const chk = (Math.floor(cx / 6) + Math.floor(cz / 6)) & 1, c = chk ? [.25, .6, .19] : [.17, .5, .15];
+    for (let k = 0; k < 3; k++) col.push(...c);
+  }
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); g.computeVertexNormals();
+  scene.add(new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true })));
+}
+// trees (instanced cones)
+{
+  const geo = new THREE.ConeGeometry(1.3, 5, 6).translate(0, 2.5, 0);
+  const m = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0x1f7a2a, flatShading: true }), 600);
+  const M = new THREE.Matrix4(); let s = 7; const r = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+  for (let i = 0; i < 600; i++) {
+    const x = (r() * 2 - 1) * 240, z = (r() * 2 - 1) * 240; if (Math.hypot(x, z) < 22) { i--; continue; }
+    const k = .7 + r(); M.makeScale(k, k * (.8 + r() * .6), k).setPosition(x, H(x, z), z); m.setMatrixAt(i, M);
+  }
+  scene.add(m);
+}
+// base buildings, ship, enemies, emissive bright things
+const spin = [];
+{
+  const mat = new THREE.MeshPhongMaterial({ color: 0x8a92a0, flatShading: true });
+  for (let i = 0; i < 7; i++) {
+    const a = i / 7 * Math.PI * 2, b = new THREE.Mesh(new THREE.BoxGeometry(4 + (i % 3), 3 + (i % 4) * 1.5, 4), mat);
+    b.position.set(Math.cos(a) * 14.5, H(0, 0) + 1.5 + (i % 4) * .7, Math.sin(a) * 14.5); b.rotation.y = -a; scene.add(b);
+  }
+  const ship = new THREE.Group();
+  ship.add(new THREE.Mesh(new THREE.ConeGeometry(1.1, 3.4, 4).rotateX(-Math.PI / 2).scale(1.35, .5, 1), new THREE.MeshPhongMaterial({ color: 0xd8dde8, flatShading: true })));
+  const wing = new THREE.Mesh(new THREE.BoxGeometry(4.4, .14, 1.4), new THREE.MeshPhongMaterial({ color: 0x4488ff, flatShading: true })); wing.position.set(0, -.05, .7); ship.add(wing);
+  const ck = new THREE.Mesh(new THREE.SphereGeometry(.5, 8, 6), new THREE.MeshPhongMaterial({ color: 0x66e0ff, emissive: 0x114466 })); ck.position.set(0, .35, -.3); ship.add(ck);
+  ship.position.set(0, 12, 0); ship.scale.setScalar(2); scene.add(ship); spin.push([ship, .4]);
+  const eMat = new THREE.MeshPhongMaterial({ color: 0xdd2222, emissive: 0x440808, flatShading: true });
+  for (let i = 0; i < 4; i++) {
+    const g = new THREE.Group();
+    g.add(new THREE.Mesh(new THREE.OctahedronGeometry(1.8).scale(1.4, .7, 1.4), eMat));
+    g.add(new THREE.Mesh(new THREE.TorusGeometry(2.6, .12, 4, 20).rotateX(Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0xff8844 })));
+    g.position.set(Math.cos(i * 1.7) * 40, 18 + i * 3, Math.sin(i * 1.7) * 40); scene.add(g); spin.push([g, 2]);
+  }
+  // emissive bright objects: hot-orange torus + yellow ring + additive beam
+  const hot = new THREE.Mesh(new THREE.TorusKnotGeometry(3, .7, 64, 8), new THREE.MeshBasicMaterial({ color: 0xffaa33 }));
+  hot.position.set(-18, 10, 8); scene.add(hot); spin.push([hot, .7]);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(8.7, .18, 6, 48).rotateX(Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0xffee66 }));
+  ring.position.y = H(0, 0) + .3; scene.add(ring);
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(.5, .5, 90, 8, 1, true), new THREE.MeshBasicMaterial({ color: 0x66ddff, transparent: true, opacity: .35, blending: THREE.AdditiveBlending, depthWrite: false }));
+  beam.position.y = 45; scene.add(beam);
+}
+// custom ShaderMaterial using the pasted snippet (stands in for the terrain shader integration)
+{
+  const m = new THREE.ShaderMaterial({
+    uniforms: { ...retroUniforms, ...drawDistanceUniforms, uFog: { value: HORIZON } },
+    vertexShader: retroSnapGLSL + `varying vec3 vW; void main(){ vec4 w=modelMatrix*vec4(position,1.); vW=w.xyz; gl_Position=retroSnap(projectionMatrix*viewMatrix*w); }`,
+    fragmentShader: `uniform vec3 uFog; uniform float uFogNear, uFogFar; varying vec3 vW;
+      void main(){ vec3 n=normalize(cross(dFdx(vW),dFdy(vW))); vec3 c=vec3(.95,.3,.75)*(max(dot(n,normalize(vec3(.5,1,.3))),0.)*.7+.35);
+      float fd=length((viewMatrix*vec4(vW,1.)).xyz); gl_FragColor=vec4(mix(c,uFog,smoothstep(uFogNear,uFogFar,fd)),1.); }`,
+  });
+  const pil = new THREE.Mesh(new THREE.CylinderGeometry(2, 3, 16, 7), m); pil.position.set(22, 8, -10); scene.add(pil); spin.push([pil, .3]);
+}
+// exhaust/explosion-like additive particles + neon line (should glow; not vertex-snapped)
+const dotTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d'), g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(.4, 'rgba(255,255,255,.7)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
+})();
+const NP = 300, pp = new Float32Array(NP * 3), pc = new Float32Array(NP * 3);
+const pg = new THREE.BufferGeometry(); pg.setAttribute('position', new THREE.BufferAttribute(pp, 3)); pg.setAttribute('color', new THREE.BufferAttribute(pc, 3));
+const parts = new THREE.Points(pg, new THREE.PointsMaterial({ size: 1.1, map: dotTex, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+parts.frustumCulled = false; scene.add(parts);
+function stepParts(t) {
+  for (let i = 0; i < NP; i++) {
+    const f = ((i / NP) + t * .5) % 1, a = i * 2.4;
+    pp[i * 3] = Math.cos(a) * f * 2; pp[i * 3 + 1] = 11 - f * 8; pp[i * 3 + 2] = Math.sin(a) * f * 2;
+    const k = 1 - f; pc[i * 3] = k; pc[i * 3 + 1] = .65 * k; pc[i * 3 + 2] = .2 * k;
+  }
+  pg.attributes.position.needsUpdate = pg.attributes.color.needsUpdate = true;
+}
+
+// ---- cave chunk from the real game module (same placement/scale idea as main.js, parked off to the side)
+const CS = 1.6, CAVE = new THREE.Vector3(600, -100, 0);
+const L = buildLevel(1);
+const caveGroup = new THREE.Group(); caveGroup.scale.setScalar(CS); caveGroup.position.copy(CAVE); scene.add(caveGroup);
+caveGroup.add(buildCaveMesh(L, { depth: 6 }));
+for (const t of L.turrets) { const m = makeTurret(); m.position.set(t.x, t.y, 0); caveGroup.add(m); }
+for (const t of L.tanks) { const m = makeTank(); m.position.set(t.x, t.y, 0); caveGroup.add(m); }
+const pod = makePod(); pod.position.set(L.orb.x, L.orb.y, 0); caveGroup.add(pod);
+const cParts = parts.clone(); cParts.scale.setScalar(1 / CS); cParts.position.set(32, 26, 1); caveGroup.add(cParts);
+
+retroizeScene(scene);
+
+// ---- pipeline + UI
+const pipe = createPipeline(renderer, { scene, camera: cam });
+const S = { ...DEFAULT_SETTINGS };
+let pipeOn = !new URLSearchParams(location.search).has('off'), view = 'field', frozen = false, T = 0;
+const views = {
+  field: { fog: HORIZON, dd: () => S.drawDistance },
+  cave: { fog: new THREE.Color(0x0d1418), dd: () => 400 },
+};
+function applySettings() { pipe.setSettings(S); refreshUI(); }
+const cycle = (arr, v) => arr[(arr.indexOf(v) + 1) % arr.length];
+const toggles = [
+  ['P', 'pipeline', () => pipeOn = !pipeOn, () => pipeOn],
+  ['R', 'retroLook', () => S.retroLook = !S.retroLook, () => S.retroLook],
+  ['B', 'bloom', () => S.bloom = S.bloom ? 0 : DEFAULT_SETTINGS.bloom, () => S.bloom > 0],
+  ['G', 'dither', () => S.ditherStrength = S.ditherStrength ? 0 : DEFAULT_SETTINGS.ditherStrength, () => S.ditherStrength > 0],
+  ['C', 'colorBits', () => S.colorBits = cycle([8, 6, 5, 4, 3], S.colorBits), () => S.colorBits < 8, () => S.colorBits],
+  ['L', 'scanlines', () => S.scanlines = S.scanlines ? 0 : DEFAULT_SETTINGS.scanlines, () => S.scanlines > 0],
+  ['A', 'chroma', () => S.chromaShift = S.chromaShift ? 0 : DEFAULT_SETTINGS.chromaShift, () => S.chromaShift > 0],
+  ['S', 'vertexSnap', () => S.vertexSnap = cycle([0, .25, .5, 1], S.vertexSnap), () => S.vertexSnap > 0, () => S.vertexSnap],
+  ['K', 'grade+grain', () => { const on = S.splitTone > 0; Object.assign(S, on ? { saturation: 1, splitTone: 0, contrast: 0, grain: 0, vignette: 0 } : { saturation: DEFAULT_SETTINGS.saturation, splitTone: DEFAULT_SETTINGS.splitTone, contrast: DEFAULT_SETTINGS.contrast, grain: DEFAULT_SETTINGS.grain, vignette: DEFAULT_SETTINGS.vignette }); }, () => S.splitTone > 0],
+  ['Z', 'renderScale', () => S.renderScale = cycle([1, .75, .5, .35, .25], S.renderScale), () => true, () => S.renderScale],
+  ['D', 'drawDist', () => S.drawDistance = cycle([120, 200, 260, 400, 800], S.drawDistance), () => true, () => S.drawDistance],
+  ['V', 'view', () => view = view === 'field' ? 'cave' : 'field', () => true, () => view],
+  ['F', 'freeze cam', () => frozen = !frozen, () => frozen],
+];
+const btns = {};
+for (const [k, name, fn] of toggles) {
+  const b = document.createElement('button'); b.onclick = () => { fn(); applySettings(); }; $('btns').appendChild(b); btns[name] = b;
+}
+function refreshUI() {
+  for (const [k, name, , on, val] of toggles) {
+    const b = btns[name]; b.textContent = `${k} ${name}${val ? ' ' + val() : ''}`; b.classList.toggle('off', !on());
+  }
+}
+addEventListener('keydown', e => { const t = toggles.find(t => 'Key' + t[0] === e.code); if (t) { t[2](); applySettings(); } });
+function resize() { pipe.resize(innerWidth, innerHeight); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize(); applySettings();
+
+function place(t) {
+  if (view === 'field') {
+    const a = t * .12; cam.fov = 62; cam.position.set(Math.cos(a) * 42, 20 + Math.sin(t * .3) * 3, Math.sin(a) * 42); cam.lookAt(0, 8, 0);
+  } else {
+    const fov = 38, vh = 30 * CS; cam.fov = fov;
+    cam.position.set(CAVE.x + (32 + Math.sin(t * .2) * 6) * CS, CAVE.y + 30 * CS, vh / 2 / Math.tan(fov / 2 * Math.PI / 180)); cam.quaternion.identity();
+  }
+  sky.position.copy(cam.position);
+  applyDrawDistance(scene, cam, views[view].dd(), views[view].fog, { sky, skyRadius: 900 });
+}
+function renderFrame(dt) {
+  if (!frozen) T += dt;
+  place(T); stepParts(T);
+  for (const [o, s] of spin) o.rotation.y = T * s;
+  if (pipeOn) pipe.render(dt);
+  else { renderer.info.reset(); retroUniforms.uSnapAmt.value = 0; renderer.setRenderTarget(null); renderer.render(scene, cam); }
+}
+let last = performance.now(), acc = 0, n = 0, fps = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, .05); last = now;
+  acc += dt; n++; if (acc > 1) { fps = n / acc; $('dbg').textContent = Math.round(fps) + ' fps'; acc = 0; n = 0; }
+  renderFrame(dt);
+  const i = pipe.info();
+  $('stats').textContent = `pipeline ${pipeOn ? 'ON' : 'OFF'}  view ${view}\nres ${pipeOn ? i.res.join('x') : renderer.domElement.width + 'x' + renderer.domElement.height}  scene calls ${renderer.info.render.calls}  tris ${renderer.info.render.triangles}\npost passes ${pipeOn ? i.postPasses : 0}  far ${cam.far.toFixed(0)}m`;
+}
+requestAnimationFrame(frame);
+
+// synchronous benchmark: n frames, each forced to finish with a 1-px readback -> ms/frame (relative numbers only)
+function bench(nf = 30) {
+  const gl = renderer.getContext(), px = new Uint8Array(4);
+  renderFrame(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);   // warm-up (program compile)
+  const t0 = performance.now();
+  for (let i = 0; i < nf; i++) { renderFrame(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
+  return +((performance.now() - t0) / nf).toFixed(2);
+}
+window.__R = {
+  pipe, S, renderer, bench,
+  set(o) { if ('pipeOn' in o) { pipeOn = o.pipeOn; delete o.pipeOn; } if ('view' in o) { view = o.view; delete o.view; } if ('frozen' in o) { frozen = o.frozen; delete o.frozen; } if ('T' in o) { T = o.T; delete o.T; } Object.assign(S, o); applySettings(); return pipe.info(); },
+  reset() { Object.assign(S, DEFAULT_SETTINGS); pipeOn = true; applySettings(); },
+  get fps() { return fps; },
+};
+</script>
+</body></html>

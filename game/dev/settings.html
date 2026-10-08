@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>settings.js dev</title>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.min.js"}}</script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:Consolas,"Courier New",monospace;color:#9ff}
+canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+#tl{position:fixed;left:16px;top:12px;font-size:18px;line-height:1.5;text-shadow:0 0 6px #0cf;pointer-events:none}
+#tl b{color:#fff}
+#hint{position:fixed;left:0;right:0;bottom:14px;text-align:center;font-size:14px;color:#cfc;pointer-events:none}
+</style></head><body>
+<canvas id="gl"></canvas>
+<div id="tl"><div>SCORE <b>0</b></div><div>SHIPS <b>3</b></div><div id="state">RUNNING</div></div>
+<div id="hint">ESC / O settings &middot; B benchmark (5 s)</div>
+<script type="module">
+import * as THREE from 'three';
+import * as S from '../js/settings.js';
+const { settings, onSettings, createDynRes, createFrameLimiter, createPerfOverlay, createSettingsMenu, runBenchmark } = S;
+window.__S = S;
+
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xbfd9f2);
+const cam = new THREE.PerspectiveCamera(62, 1, 0.1, 1200);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+
+// cubes on a grid (draw distance visible through fog / camera.far)
+const cubes = new THREE.InstancedMesh(new THREE.BoxGeometry(4, 4, 4), new THREE.MeshLambertMaterial({ color: 0x55aa66 }), 900);
+{ const m = new THREE.Matrix4(); let i = 0; for (let x = -15; x < 15; x++) for (let z = -15; z < 15; z++) { m.makeTranslation(x * 24, 2, z * 24); cubes.setMatrixAt(i++, m); } }
+scene.add(cubes);
+const hero = new THREE.Mesh(new THREE.BoxGeometry(8, 8, 8), new THREE.MeshLambertMaterial({ color: 0xff8844 }));
+hero.position.y = 14; scene.add(hero);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(800, 800), new THREE.MeshLambertMaterial({ color: 0x2a5a3a }));
+ground.rotation.x = -Math.PI / 2; scene.add(ground);
+
+// particle cloud: count = particleBudget, animated on the GPU, additive (fill-rate cost)
+let pts;
+function buildParticles() {
+  if (pts) { scene.remove(pts); pts.geometry.dispose(); pts.material.dispose(); }
+  const n = settings.effects.particleBudget, a = new Float32Array(n * 3);
+  for (let i = 0; i < n * 3; i++) a[i] = Math.random();
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(a, 3));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { t: { value: 0 } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: `uniform float t; varying float vA;
+      void main(){ vec3 r = position; float a = r.x*6.283 + t*(0.3+r.y), rad = 6.0 + r.z*40.0;
+        vec3 p = vec3(cos(a)*rad, 14.0 + sin(t*2.0 + r.x*40.0)*6.0*r.y, sin(a)*rad);
+        vec4 mv = modelViewMatrix*vec4(p,1.0); gl_Position = projectionMatrix*mv; gl_PointSize = 300.0/-mv.z; vA = r.y; }`,
+    fragmentShader: `varying float vA; void main(){ vec2 c = gl_PointCoord-0.5; float d = 1.0-length(c)*2.0; if(d<0.0) discard; gl_FragColor = vec4(vec3(1.0,0.6,0.2)*d*0.25, 1.0); }`,
+  });
+  pts = new THREE.Points(g, mat); pts.frustumCulled = false; scene.add(pts);
+}
+function applyWorld() {
+  const dd = settings.world.drawDistance;
+  scene.fog = new THREE.Fog(0xbfd9f2, dd * 0.55, dd); cam.far = dd * 1.05; cam.updateProjectionMatrix();
+}
+buildParticles(); applyWorld();
+onSettings((s, path) => {
+  if (path === '*' || path === 'effects.particleBudget') buildParticles();
+  if (path === '*' || path.startsWith('world.')) applyWorld();
+});
+
+const dyn = createDynRes({ getSettings: () => settings });
+const limiter = createFrameLimiter();
+const overlay = createPerfOverlay();
+let paused = false, fly = null;
+const menu = createSettingsMenu({
+  onOpen: () => { paused = true; document.getElementById('state').textContent = 'PAUSED'; },
+  onClose: () => { paused = false; document.getElementById('state').textContent = 'RUNNING'; },
+  onBenchmark: () => bench(5),
+});
+window.__menu = menu;
+const hooks = {
+  begin() { fly = { t: 0 }; },
+  step(t01) { fly.t = t01; },
+  end() { fly = null; },
+};
+window.bench = (sec = 5, opts = {}) => runBenchmark(hooks, { seconds: sec, ...opts });
+const bench = window.bench;
+addEventListener('keydown', e => { if (e.code === 'KeyB' && !menu.isOpen) bench(5); });
+
+let last = performance.now(), simT = 0, lastRender = last, sizeW = 0, sizeH = 0;
+S.setSetting('display.showFps', true);
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (!paused) simT += dt;
+  if (!limiter.shouldRender(now)) return;
+  const frameMs = now - lastRender; lastRender = now;
+  const sc = dyn.update(frameMs);
+  const d = settings.display;
+  const pr = Math.min(devicePixelRatio, d.pixelRatioCap) * d.renderScale * sc, w = innerWidth, h = innerHeight;
+  if (pr !== renderer.getPixelRatio()) renderer.setPixelRatio(pr);
+  if (w !== sizeW || h !== sizeH) { renderer.setSize(w, h, false); sizeW = w; sizeH = h; }
+  cam.aspect = w / h; cam.updateProjectionMatrix();
+  if (fly) {   // scripted fly-through
+    const a = fly.t * Math.PI * 2;
+    cam.position.set(Math.cos(a) * (40 + fly.t * 120), 12 + Math.sin(a * 2) * 6, Math.sin(a) * (40 + fly.t * 120));
+  } else cam.position.set(Math.cos(simT * 0.2) * 45, 20, Math.sin(simT * 0.2) * 45);
+  cam.lookAt(0, 10, 0);
+  hero.rotation.set(simT * 0.7, simT, 0);
+  pts.material.uniforms.t.value = simT;
+  renderer.render(scene, cam);
+  const ri = renderer.info.render;
+  overlay.update(frameMs, { res: [canvas.width, canvas.height], scale: sc, particles: settings.effects.particleBudget, drawCalls: ri.calls, triangles: ri.triangles });
+}
+requestAnimationFrame(frame);
+if (!new URLSearchParams(location.search).has('nomenu')) menu.open();
+</script>
+</body></html>

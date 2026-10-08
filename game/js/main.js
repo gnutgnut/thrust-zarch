@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { buildLevel } from './level.js';
 import { buildCaveMesh, makeTurret, makeTank, makePod, makeRope } from './cave3d.js';
 import { Sfx } from './audio.js';
+import { settings, onSettings, createDynRes, createFrameLimiter, createPerfOverlay, createSettingsMenu, runBenchmark } from './settings.js';
 
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -161,10 +162,9 @@ const sky = new THREE.Mesh(new THREE.SphereGeometry(900, 24, 12), new THREE.Shad
 }));
 sky.renderOrder = -10; zScene.add(sky);
 
-const TG = 2.5, TN = 170;
-const terrainGeo = new THREE.PlaneGeometry(TG * TN, TG * TN, TN, TN); terrainGeo.rotateX(-Math.PI / 2);
-const terrain = new THREE.Mesh(terrainGeo, new THREE.ShaderMaterial({
-  uniforms: { uFog: { value: HORIZON }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
+let TG = 2.5;
+const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMaterial({
+  uniforms: { uFog: { value: zScene.fog.color }, uFogNear: { value: 120 }, uFogFar: { value: 380 }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
   vertexShader: `
     varying vec3 vW; varying float vRaw;
     float rawH(vec2 p){return 14.*sin(p.x*.035+1.3)*cos(p.y*.04)+9.*sin(p.x*.09+p.y*.07)+5.*sin(p.y*.13-p.x*.05)+2.5*sin(p.x*.31)*sin(p.y*.27)+8.;}
@@ -177,7 +177,7 @@ const terrain = new THREE.Mesh(terrainGeo, new THREE.ShaderMaterial({
       gl_Position=projectionMatrix*viewMatrix*w;
     }`,
   fragmentShader: `
-    varying vec3 vW; varying float vRaw; uniform vec3 uFog; uniform vec3 uSun;
+    varying vec3 vW; varying float vRaw; uniform vec3 uFog; uniform vec3 uSun; uniform float uFogNear, uFogFar;
     void main(){
       if(abs(vW.x)<${HOLE_X.toFixed(2)}&&abs(vW.z)<${HOLE_Z.toFixed(2)}) discard;
       vec3 n=normalize(cross(dFdx(vW),dFdy(vW))); if(n.y<0.) n=-n;
@@ -192,16 +192,24 @@ const terrain = new THREE.Mesh(terrainGeo, new THREE.ShaderMaterial({
       float d=length(vW.xz);
       if(d<${BASE_R.toFixed(1)}){ vec3 pc=vec3(.5,.52,.58)*l; if(d<8.5){float r=d/8.5; pc=mix(vec3(.15,.16,.2),vec3(.95,.8,.1),step(.5,fract(r*4.)))*l;} c=pc; }
       float fd=length((viewMatrix*vec4(vW,1.)).xyz);
-      gl_FragColor=vec4(mix(c,uFog,smoothstep(130.,370.,fd)),1.);
+      gl_FragColor=vec4(mix(c,uFog,smoothstep(uFogNear,uFogFar,fd)),1.);
     }`,
 }));
 terrain.frustumCulled = false; zScene.add(terrain);
+// the grid follows the camera and only reaches the draw distance: short draw distance is both the retro look and the fps lever
+function rebuildTerrain() {
+  const dd = settings.world.drawDistance, det = settings.world.terrainDetail;
+  TG = [3.6, 2.6, 2][det] ?? 2.6;
+  const TN = Math.ceil(dd * 2.1 / TG);
+  terrain.geometry.dispose(); terrain.geometry = new THREE.PlaneGeometry(TG * TN, TG * TN, TN, TN).rotateX(-Math.PI / 2);
+}
 
 // trees
+let treeMesh = null, treeTotal = 0;
 {
   let s = 12345; const r = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
   const geo = new THREE.ConeGeometry(1.3, 5, 6); geo.translate(0, 2.5, 0);
-  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0x1f7a2a, flatShading: true }), 1400);
+  const mesh = treeMesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0x1f7a2a, flatShading: true }), 1400);
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(); let n = 0;
   for (let i = 0; i < 6000 && n < 1400; i++) {
     const x = (r() * 2 - 1) * BOUND, z = (r() * 2 - 1) * BOUND, h = terrainH(x, z);
@@ -209,7 +217,7 @@ terrain.frustumCulled = false; zScene.add(terrain);
     const k = 0.7 + r() * 1.1; sc.set(k, k * (0.8 + r() * 0.6), k);
     m.compose(new THREE.Vector3(x, h, z), q, sc); mesh.setMatrixAt(n++, m);
   }
-  mesh.count = n; zScene.add(mesh);
+  mesh.count = treeTotal = n; zScene.add(mesh);
 }
 // base
 const baseGroup = new THREE.Group(); baseGroup.position.set(0, PAD_H, 0); zScene.add(baseGroup);
@@ -273,6 +281,7 @@ function resetZarch(fromPad) {
   }
 }
 function killPlayerZ(why) {
+  if (G.bench) return;
   if (!Z.alive) return;
   Z.alive = false; Z.deadT = 2.4; shipMesh.visible = false; shipShadow.visible = false;
   explode(zParts, Z.pos.x, Z.pos.y, Z.pos.z, 120, 28, false); sfx.boom(1.2); sfx.engine(0);
@@ -439,6 +448,7 @@ function shipPts() {
   return [[0, 1], [-.85, -.7], [.85, -.7]].map(([lx, ly]) => [T.x + lx * c + ly * s, T.y - lx * s + ly * c]);
 }
 function crashThrust(why) {
+  if (G.bench) { T.vx = T.vy = 0; return; }
   if (!T.alive) return;
   T.alive = false; T.deadT = 2.2; shipMesh.visible = false;
   explode(T.parts, T.x, T.y, 0, 90, 14, true); sfx.boom(1); sfx.engine(0); say(why, 2);
@@ -596,9 +606,51 @@ function updateHud() {
     $('hint').textContent = '';
   }
 }
+let pixRatio = 0;
 function resize() {
   const w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); zCam.aspect = w / h; zCam.updateProjectionMatrix();
 }
+function applyPixelRatio(dynScale) {
+  const d = settings.display, pr = Math.min(devicePixelRatio, d.pixelRatioCap) * d.renderScale * dynScale;
+  if (Math.abs(pr - pixRatio) > 0.01) { pixRatio = pr; renderer.setPixelRatio(pr); resize(); }
+}
+
+// ---------------------------------------------------------------- settings, perf, benchmark
+const limiter = createFrameLimiter(), dynRes = createDynRes({ getSettings: () => settings }), perf = createPerfOverlay();
+let menuPaused = false;
+const menu = createSettingsMenu({
+  onOpen: () => { menuPaused = true; keys.clear(); sfx.engine(0); },
+  onClose: () => { menuPaused = false; last = performance.now(); },
+  onBenchmark: () => runBenchmark(benchHooks, { seconds: 20 }),
+});
+function applySettings(s, path) {
+  const all = path === '*';
+  if (all || path.startsWith('world.drawDistance') || path.startsWith('world.terrainDetail')) rebuildTerrain();
+  if (all || path === 'world.trees') if (treeMesh) treeMesh.count = Math.round(treeTotal * s.world.trees);
+  if (all || path.startsWith('audio')) { sfx.setVolume?.({ master: s.audio.master, music: s.audio.music, sfx: s.audio.sfx }); sfx.setQuality?.(s.audio.audioQuality); }
+  $('dbg').style.display = s.display.showFps ? 'none' : '';
+}
+onSettings(applySettings); applySettings(settings, '*');
+// Scripted fly-through: a lap of the landscape, a dive into the shaft, a run down the cave and back out.
+const benchHooks = {
+  begin() { newGame(); G.bench = true; Z.assist = false; chaseCam = true; },
+  step(t) {
+    if (t < 0.6) {
+      const a = t / 0.6 * Math.PI * 2, R = 150 * Math.sin(Math.min(1, t / 0.6 * 1.15) * Math.PI);
+      if (G.mode !== 'zarch') return;
+      const x = Math.sin(a) * R, z = R - Math.cos(a) * R * 0.6 + 4, y = groundY(x, z) + 22;
+      const nx = Math.cos(a), nz = Math.sin(a) * 0.6, m = Math.hypot(nx, nz);
+      Z.pos.set(x, Math.max(y, PAD_H + 14), z); Z.vel.set(nx / m * 40, 0, nz / m * 40); Z.facing.set(nx / m, nz / m); Z.hd = Math.atan2(nx / m, -nz / m);
+      Z.lean.set(nx / m * 0.4, nz / m * 0.4); Z.throttle = 0.6;
+    } else if (G.mode === 'zarch') {
+      Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -8, 0); Z.lean.set(0, 0); enterCave();
+    } else {
+      const u = (t - 0.6) / 0.4, L = T.lvl;
+      T.x = 32.5 + Math.sin(u * Math.PI * 2) * 6; T.y = L.H - 2 - Math.sin(u * Math.PI) * 30; T.vx = T.vy = 0; T.ang = Math.sin(u * 9) * 0.5; T.thrOn = 1;
+    }
+  },
+  end() { G.bench = false; chaseCam = false; G.state = 'title'; G.mode = 'zarch'; resetZarch(true); $('title').style.display = 'flex'; },
+};
 addEventListener('resize', resize); resize();
 
 const _u = new THREE.Vector3(), _f = new THREE.Vector3(), _r = new THREE.Vector3(), _w = new THREE.Vector3(), _m = new THREE.Matrix4(), _tgt = new THREE.Vector3();
@@ -644,7 +696,10 @@ function updateCamsAndMeshes(dt, time) {
     zCam.quaternion.slerpQuaternions(camA.quaternion, camS.quaternion, e);
   }
   const fov = lerp(62, SIDE_FOV, e); if (Math.abs(zCam.fov - fov) > 0.01) { zCam.fov = fov; zCam.updateProjectionMatrix(); }
-  zScene.fog.color.copy(HORIZON).multiplyScalar(1 - 0.85 * e); zScene.fog.near = lerp(120, 200, e);
+  const dd = settings.world.drawDistance, fogFar = lerp(dd, Math.max(dd, 170), e);
+  zScene.fog.color.copy(HORIZON).multiplyScalar(1 - 0.85 * e); zScene.fog.near = lerp(dd * 0.45, 120, e); zScene.fog.far = fogFar;
+  if (Math.abs(zCam.far - fogFar * 1.15) > 1) { zCam.far = fogFar * 1.15; zCam.updateProjectionMatrix(); }
+  terrain.material.uniforms.uFogNear.value = zScene.fog.near; terrain.material.uniforms.uFogFar.value = zScene.fog.far;
   sky.position.copy(zCam.position);
   terrain.position.set(Math.round(zCam.position.x / TG) * TG, 0, Math.round(zCam.position.z / TG) * TG);
 
@@ -691,13 +746,15 @@ function updateCamsAndMeshes(dt, time) {
 let last = performance.now(), fpsAcc = 0, fpsN = 0;
 function frame(now) {
   requestAnimationFrame(frame);
-  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  if (!limiter.shouldRender(now)) return;
+  const frameMs = now - last, dt = Math.min(frameMs / 1000, 0.05); last = now;
+  applyPixelRatio(dynRes.update(frameMs));
   fpsAcc += dt; fpsN++; if (fpsAcc > 1) { $('dbg').textContent = Math.round(fpsN / fpsAcc) + ' fps'; fpsAcc = 0; fpsN = 0; }
   const inp = readInput();
   if (inp.start && !padWasStart) { sfx.init(); pressStart(); }
   padWasStart = inp.start;
   if (G.msgT > 0) { G.msgT -= dt; if (G.msgT <= 0 && G.state !== 'paused') say(''); }
-  if (G.state === 'play') {
+  if (G.state === 'play' && !menuPaused) {
     if (G.mode === 'zarch') updateZarch(dt, inp); else updateThrust(dt, inp);
   } else if (G.state === 'trans') {
     const tr = G.tr; tr.t += dt; const D = 0.8;
@@ -708,7 +765,9 @@ function frame(now) {
   updateCamsAndMeshes(dt, now / 1000);
   updateHud();
   renderer.render(zScene, zCam);
+  const ri = renderer.info.render;
+  perf.update(frameMs, { res: [canvas.width, canvas.height], scale: dynRes.scale, drawCalls: ri.calls, triangles: ri.triangles });
 }
 buildCave(1); resetZarch(true);
 requestAnimationFrame(frame);
-if (params.has('debug')) { window.__G = { G, Z, T, newGame, enemies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('thrust')) { newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); } }
+if (params.has('debug')) { window.__G = { G, Z, T, settings, menu, benchHooks, runBenchmark, newGame, enemies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('thrust')) { newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); } }
