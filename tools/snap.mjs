@@ -70,6 +70,7 @@ function startServer(root) {
     const srv = http.createServer((req, res) => {
       let p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
       if (p === '/favicon.ico' && !fs.existsSync(path.join(root, 'favicon.ico'))) { res.writeHead(204); return res.end(); }
+      if (p === '/version.json') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end('{"commit":"harness","dirty":false,"date":""}'); }
       if (p.endsWith('/')) p += 'index.html';
       const f = path.resolve(root, '.' + p);
       if (!f.startsWith(root)) { res.writeHead(403); return res.end(); }

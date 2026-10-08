@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>armies.js dev</title>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.min.js"}}</script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:Consolas,"Courier New",monospace;color:#9ff}
+canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+canvas#map{position:fixed;inset:0;width:100%;height:100%;pointer-events:none}
+#info{position:fixed;left:10px;top:8px;font-size:12px;line-height:1.35;white-space:pre;text-shadow:0 0 3px #000,0 0 6px #000;pointer-events:none}
+#msg{position:fixed;left:0;right:0;top:18%;text-align:center;font-size:24px;color:#ff8;letter-spacing:3px;text-shadow:0 0 6px #000;pointer-events:none}
+#hint{position:fixed;left:0;right:0;bottom:10px;text-align:center;font-size:13px;color:#cfc;text-shadow:0 0 4px #000;pointer-events:none}
+.bar{display:inline-block;height:8px;background:linear-gradient(90deg,#4f6,#fd2,#f52);vertical-align:middle}
+</style></head><body>
+<canvas id="gl"></canvas><canvas id="map"></canvas>
+<div id="info"></div><div id="msg"></div>
+<div id="hint">C camera (top / chase / base) &middot; B next base &middot; K kill selected base &middot; F autofire &middot; I infection dots &middot; +/- time scale</div>
+<script type="module">
+import * as THREE from 'three';
+import { createArmies, TIERS, ROSTER, SHIP_TYPES, shipGeometry } from '../js/armies.js';
+
+const $ = id => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v)), lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rnd = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+
+// ---- terrain (copied from main.js)
+const PAD_H = 6, BASE_R = 18, BOUND = 360, STRIP_X = 76, STRIP_Z = 9, HOLE_X = 5.6, HOLE_Z = 4.8;
+const rawH = (x, z) => 14 * Math.sin(x * .035 + 1.3) * Math.cos(z * .04) + 9 * Math.sin(x * .09 + z * .07) + 5 * Math.sin(z * .13 - x * .05) + 2.5 * Math.sin(x * .31) * Math.sin(z * .27) + 8;
+const stripW = (x, z) => smooth(0, 14, Math.hypot(Math.max(Math.abs(x) - STRIP_X, 0), Math.max(Math.abs(z) - STRIP_Z, 0)));
+const terrainH = (x, z) => { const h = lerp(PAD_H, rawH(x, z), smooth(BASE_R, 60, Math.hypot(x, z))); return lerp(Math.max(h, PAD_H + 1), h, stripW(x, z)); };
+const inHole = (x, z) => Math.abs(x) < HOLE_X && Math.abs(z) < HOLE_Z;
+const groundY = (x, z) => inHole(x, z) ? -1e4 : Math.max(terrainH(x, z), 0);
+
+// ---- renderer / scene
+const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const HORIZON = new THREE.Color(0xbfd9f2);
+scene.background = HORIZON;
+const fog = new THREE.Fog(HORIZON, 120, 380);
+const cam = new THREE.PerspectiveCamera(62, 1, 0.5, 2000);
+scene.add(new THREE.HemisphereLight(0xcfe6ff, 0x4a5a34, 0.9));
+const sun = new THREE.DirectionalLight(0xfff0d0, 1.1); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+{
+  const N = 190, S = 2 * BOUND + 40, g = new THREE.PlaneGeometry(S, S, N, N); g.rotateX(-Math.PI / 2);
+  const p = g.attributes.position, col = new Float32Array(p.count * 3), c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), z = p.getZ(i), h = terrainH(x, z); p.setY(i, Math.max(h, 0));
+    const chk = (Math.floor(x / 6) + Math.floor(z / 6)) & 1;
+    if (h <= 0) c.setRGB(.05, .2, chk ? .55 : .5);
+    else if (h < 2) c.setRGB(.78, .72, .45);
+    else if (h > 30) c.setRGB(.5, .41, .3);
+    else c.setRGB(.2, chk ? .56 : .5, .17);
+    if (Math.hypot(x, z) < BASE_R) c.setRGB(.5, .52, .58);
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3)); g.computeVertexNormals();
+  scene.add(new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true })));
+  const pad = new THREE.Mesh(new THREE.CylinderGeometry(8.5, 8.5, 0.4, 32), new THREE.MeshLambertMaterial({ color: 0xf0c020 }));
+  pad.position.set(0, PAD_H, 0); scene.add(pad);
+}
+
+// ---- dev effects (stand-ins for main's particles and bullets)
+const dot = (() => { const c = document.createElement('canvas'); c.width = c.height = 32; const x = c.getContext('2d'), g = x.createRadialGradient(16, 16, 0, 16, 16, 16); g.addColorStop(0, '#fff'); g.addColorStop(1, 'rgba(255,255,255,0)'); x.fillStyle = g; x.fillRect(0, 0, 32, 32); return new THREE.CanvasTexture(c); })();
+function cloud(max, size) {
+  const pos = new Float32Array(max * 3), col = new Float32Array(max * 3), g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const o = new THREE.Points(g, new THREE.PointsMaterial({ size, map: dot, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+  o.frustumCulled = false; scene.add(o);
+  return { n: 0, begin() { this.n = 0; }, add(x, y, z, r, gg, b) { if (this.n >= max) return; const i = this.n++ * 3; pos[i] = x; pos[i + 1] = y; pos[i + 2] = z; col[i] = r; col[i + 1] = gg; col[i + 2] = b; },
+    end() { g.setDrawRange(0, this.n); g.attributes.position.needsUpdate = g.attributes.color.needsUpdate = true; } };
+}
+const partCloud = cloud(4000, 1.3), bulCloud = cloud(800, 2.2);
+const parts = [], eBul = [], pBul = [];
+const stats = { score: 0, explosions: 0, enemyShots: 0, playerHits: 0, rams: 0, ramWhy: {}, sfx: {}, says: 0 };
+const sfx = new Proxy({}, { get: (_, k) => (...a) => { stats.sfx[k] = (stats.sfx[k] || 0) + 1; } });
+let msgT = 0;
+const ctx = {
+  scene, groundY, terrainH, BOUND, PAD_H, rnd, seed: +(q.get('seed') || 1),
+  spawnBullet(b) { stats.enemyShots++; if (eBul.length < 600) eBul.push(b); },
+  explode(p, power) {
+    stats.explosions++;
+    const n = Math.min(160, 10 + power * 30);
+    for (let i = 0; i < n && parts.length < 3800; i++) { const a = rnd(6.283), e = rnd(-1, 1), s = rnd(0.2, 1) * (6 + power * 6), h = Math.sqrt(1 - e * e); parts.push({ x: p.x, y: p.y, z: p.z, vx: Math.cos(a) * h * s, vy: e * s, vz: Math.sin(a) * h * s, life: rnd(0.5, 1.2) * (0.8 + power * 0.2), max: 1.4, hot: Math.random() }); }
+  },
+  say(t, s = 2) { stats.says++; $('msg').textContent = t; msgT = s; },
+  addScore(n) { stats.score += n; },
+  sfx,
+};
+const armies = createArmies(ctx);
+if (q.has('draw')) armies.setDrawDistance(+q.get('draw'));
+if (q.has('max')) armies.setMaxShips(+q.get('max'));
+
+// ---- fake player: orbits the origin, auto-fires at the nearest ship (or the selected base's parts with ?shootbase)
+const ORBIT = +(q.get('orbit') || 160);
+const player = { pos: new THREE.Vector3(ORBIT, 30, 0), vel: new THREE.Vector3(), alive: true, ram(why) { stats.rams++; stats.ramWhy[why] = (stats.ramWhy[why] || 0) + 1; } };
+let pa = 0, autofire = !q.has('nofire'), fireCd = 0, simT = 0;
+const shipMesh = new THREE.Mesh(new THREE.ConeGeometry(1.1, 3.4, 4).rotateX(Math.PI / 2), new THREE.MeshPhongMaterial({ color: 0x55ccff, emissive: 0x113355, flatShading: true }));
+scene.add(shipMesh);
+
+function step(dt) {
+  simT += dt;
+  // player orbit
+  const sp = 24; pa += sp / ORBIT * dt;
+  const nx = Math.cos(pa) * ORBIT, nz = Math.sin(pa) * ORBIT;
+  const ty = Math.max(groundY(nx, nz), armies.heightAt(nx, nz), PAD_H) + 16;
+  const ny = lerp(player.pos.y, ty, 1 - Math.exp(-2 * dt));
+  player.vel.set((nx - player.pos.x) / dt, (ny - player.pos.y) / dt, (nz - player.pos.z) / dt);
+  player.pos.set(nx, ny, nz);
+  // player fire
+  fireCd -= dt;
+  if (autofire && fireCd <= 0) {
+    let best = null, bd = 95;
+    for (const s of armies.ships) { const d = s.pos.distanceTo(player.pos); if (d < bd) { bd = d; best = s.pos; } }
+    if (best) {
+      fireCd = 0.15;
+      const t = bd / 75, aim = best.clone(); aim.y += 0.5 * 2.25 * t * t;
+      pBul.push({ p: player.pos.clone(), v: aim.sub(player.pos).normalize().multiplyScalar(75), life: 1.8 });
+    }
+  }
+  for (let i = pBul.length - 1; i >= 0; i--) {
+    const b = pBul[i]; b.life -= dt; b.v.y -= 2.25 * dt; b.p.addScaledVector(b.v, dt);
+    if (b.life <= 0 || b.p.y < groundY(b.p.x, b.p.z) || armies.hitTest(b.p, 0.5, 1)) { pBul[i] = pBul[pBul.length - 1]; pBul.pop(); }
+  }
+  for (let i = eBul.length - 1; i >= 0; i--) {
+    const b = eBul[i]; b.life -= dt; b.v.y -= 2.25 * dt; b.p.addScaledVector(b.v, dt);
+    let dead = b.life <= 0 || b.p.y < groundY(b.p.x, b.p.z);
+    if (!dead && b.p.distanceTo(player.pos) < 2.1) { dead = true; stats.playerHits++; }
+    if (dead) { eBul[i] = eBul[eBul.length - 1]; eBul.pop(); }
+  }
+  armies.update(dt, player);
+  for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.life -= dt; if (p.life <= 0) { parts[i] = parts[parts.length - 1]; parts.pop(); continue; } p.vy -= 9 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt; }
+}
+
+// destroy base i through the public hitTest only: pylons, then the reactor until it goes critical
+function killBase(i) {
+  const log = []; let shots = 0;
+  for (let guard = 0; guard < 2000; guard++) {
+    const b = armies.bases()[i]; if (!b || !b.alive || b.critical) break;
+    const t = armies.targets(i).find(t => t.alive && t.kind === 'pylon') || armies.targets(i).find(t => t.kind === 'reactor');
+    const hit = armies.hitTest(t.p, 0.5, 1); shots++;
+    if (!hit) { log.push('miss on ' + t.kind); break; }
+  }
+  const b = armies.bases()[i];
+  log.push(`${shots} shots -> ${b.name} shields ${b.shields} hp ${b.hp} critical ${b.critical.toFixed(2)}`);
+  return log;
+}
+window.__A = { armies, player, stats, step, killBase, TIERS, ROSTER, get parts() { return parts.length; }, eBul, pBul };
+// synchronous headless sim: n seconds at fixed dt; returns maxima and sanity checks
+window.__sim = (secs = 60, dt = 1 / 30) => {
+  const max = { ships: 0, bombs: 0, eBul: 0, parts: 0 }, byMax = {}; let bad = 0;
+  const t0 = performance.now();
+  for (let t = 0; t < secs; t += dt) {
+    step(dt);
+    const st = armies.stats();
+    max.ships = Math.max(max.ships, st.ships); max.bombs = Math.max(max.bombs, st.bombs); max.eBul = Math.max(max.eBul, eBul.length); max.parts = Math.max(max.parts, parts.length);
+    for (const k in st.byType) byMax[k] = Math.max(byMax[k] || 0, st.byType[k]);
+    for (const s of armies.ships) if (!Number.isFinite(s.pos.x + s.pos.y + s.pos.z)) bad++;
+  }
+  const st = armies.stats();
+  return { secs, ms: Math.round(performance.now() - t0), max, byMax, final: st, nonFinite: bad, intensity: +armies.intensity().toFixed(3),
+    score: stats.score, enemyShots: stats.enemyShots, playerHits: stats.playerHits, rams: stats.rams, ramWhy: stats.ramWhy, sfx: stats.sfx, explosions: stats.explosions,
+    bases: armies.bases().map(b => `${b.name} ${b.alive ? 'alive' : 'DEAD'} hp ${b.hp}/${b.maxHp} sh ${b.shields}/${b.maxShields} army ${b.army}`) };
+};
+
+// ---- cameras
+const camModes = ['top', 'chase', 'base', 'gallery'];
+// gallery: one of each ship type, faction-tinted, lined up in the sky above the pad
+const gallery = new THREE.Group(); gallery.visible = false; scene.add(gallery);
+{
+  const tints = [0xff8a3d, 0xe8343a, 0xe8343a, 0xa64dff, 0x3dff7a, 0xff8a3d, 0xa64dff];
+  let x = 0;
+  SHIP_TYPES.forEach((t, i) => {
+    const g = shipGeometry(t); g.computeBoundingBox(); const w = Math.max(g.boundingBox.max.x - g.boundingBox.min.x, g.boundingBox.max.z - g.boundingBox.min.z);
+    x += w / 2 + 2;
+    const m = new THREE.Mesh(g, new THREE.MeshPhongMaterial({ vertexColors: true, flatShading: true, color: tints[i] }));
+    m.position.set(x, 150, 0); m.rotation.y = 0.9; gallery.add(m); x += w / 2 + 2;
+  });
+  gallery.children.forEach(m => m.position.x -= x / 2);
+}
+let camMode = q.get('cam') || 'top', baseSel = +(q.get('base') || 0), showDots = true, timeScale = +(q.get('speed') || 1);
+addEventListener('keydown', e => {
+  if (e.code === 'KeyC') camMode = camModes[(camModes.indexOf(camMode) + 1) % camModes.length];
+  if (e.code === 'KeyB') baseSel = (baseSel + 1) % armies.bases().length;
+  if (e.code === 'KeyK') console.log(killBase(baseSel).join(' | '));
+  if (e.code === 'KeyF') autofire = !autofire;
+  if (e.code === 'KeyI') { showDots = !showDots; armies.setShowInfection(showDots); }
+  if (e.key === '+' || e.key === '=') timeScale = Math.min(8, timeScale * 2);
+  if (e.key === '-') timeScale = Math.max(0.125, timeScale / 2);
+});
+const camPos = new THREE.Vector3(0, 300, 300), camLook = new THREE.Vector3();
+function updateCam(dt, now) {
+  const P = player.pos;
+  gallery.visible = camMode === 'gallery';
+  if (camMode === 'gallery') { scene.fog = null; cam.up.set(0, 1, 0); cam.position.set(0, 162, 46); cam.lookAt(0, 149, 0); gallery.children.forEach(m => m.rotation.y = 0.9 + Math.sin(now * 0.5) * 0.5); return; }
+  if (camMode === 'top') {
+    scene.fog = null; armies.setDrawDistance(1500); cam.position.set(0, 640, 0.01); cam.up.set(0, 0, -1); cam.lookAt(0, 0, 0); return;
+  }
+  scene.fog = fog; cam.up.set(0, 1, 0);
+  armies.setDrawDistance(camMode === 'base' ? 1500 : +(q.get('draw') || 300));   // the module culls around the player; the base cam is elsewhere
+  if (camMode === 'chase') {
+    const f = player.vel.clone().setY(0).normalize();
+    camPos.lerp(new THREE.Vector3(P.x - f.x * 24, P.y + 9, P.z - f.z * 24), 1 - Math.exp(-4 * dt));
+    camLook.set(P.x + f.x * 20, P.y - 2, P.z + f.z * 20);
+  } else {
+    const b = armies.bases()[baseSel % armies.bases().length], a = now * 0.12, d = b.r * 2.6 + 18;
+    camPos.set(b.x + Math.cos(a) * d, b.y + d * 0.55, b.z + Math.sin(a) * d); camLook.set(b.x, b.y + 2, b.z);
+  }
+  camPos.y = Math.max(camPos.y, groundY(camPos.x, camPos.z) + 3);
+  cam.position.copy(camPos); cam.lookAt(camLook);
+}
+
+// ---- overlay: radar-style map from contacts() (top view) + readout
+const mapC = $('map'), mg = mapC.getContext('2d');
+function drawOverlay() {
+  const W = mapC.width = innerWidth, H = mapC.height = innerHeight; mg.clearRect(0, 0, W, H);
+  if (camMode === 'top') {
+    // project world xz with the camera so dots sit on the 3D view
+    const v = new THREE.Vector3(), proj = (x, y, z) => { v.set(x, y, z).project(cam); return [(v.x + 1) / 2 * W, (1 - v.y) / 2 * H]; };
+    if (showDots) { mg.fillStyle = 'rgba(120,255,60,.35)'; for (const p of armies.infection()) { const [X, Y] = proj(p.x, 0, p.z), [X2] = proj(p.x + p.r, 0, p.z); mg.beginPath(); mg.arc(X, Y, Math.max(1, X2 - X), 0, 6.283); mg.fill(); } }
+    mg.strokeStyle = 'rgba(40,20,10,.7)'; for (const c of armies.craters()) { const [X, Y] = proj(c.x, 0, c.z), [X2] = proj(c.x + c.r, 0, c.z); mg.beginPath(); mg.arc(X, Y, Math.max(1, X2 - X), 0, 6.283); mg.stroke(); }
+    for (const c of armies.contacts()) {
+      const [X, Y] = proj(c.x, c.kind === 'base' ? (armies.bases().find(b => b.x === c.x)?.y || 0) : 0, c.z); mg.fillStyle = c.color;
+      if (c.kind === 'base') { mg.strokeStyle = c.critical ? '#fff' : c.color; mg.lineWidth = 2; mg.strokeRect(X - c.size, Y - c.size, c.size * 2, c.size * 2); }
+      else mg.fillRect(X - c.size / 2 - 1, Y - c.size / 2 - 1, c.size + 2, c.size + 2);
+    }
+    mg.font = '12px Consolas,monospace';
+    armies.bases().forEach((b, i) => { const [X, Y] = proj(b.x, b.y, b.z); mg.fillStyle = b.alive ? '#fff' : '#888'; mg.fillText(`${i}:${b.name}${b.alive ? '' : ' (X)'}`, X + 14, Y + 4); });
+    const [px, py] = proj(player.pos.x, 0, player.pos.z); mg.fillStyle = '#4ff'; mg.beginPath(); mg.arc(px, py, 5, 0, 6.283); mg.fill();
+  }
+  const st = armies.stats(), I = armies.intensity();
+  const lines = [`ARMIES dev   cam ${camMode}   x${timeScale}   t ${st.time.toFixed(0)}s   ${fpsTxt}`,
+    `intensity ${I.toFixed(2)} <span class="bar" style="width:${Math.round(I * 120)}px"></span>`,
+    `ships ${st.ships}/${st.maxShips}  waves ${st.waves}  bombs ${st.bombs}  infection ${st.infection}  craters ${st.craters}  homeHits ${st.homeHits}`,
+    SHIP_TYPES.map(t => `${t} ${st.byType[t]}`).join('  '),
+    `score ${stats.score}  enemy shots ${stats.enemyShots}  player hit ${stats.playerHits}  rams ${stats.rams}`, ''];
+  armies.bases().forEach((b, i) => lines.push(`${i === baseSel ? '>' : ' '}${i} ${b.name.padEnd(17)} ${b.tier.padEnd(8)} ${b.alive ? (b.critical ? 'CRIT ' + b.critical.toFixed(1) : (b.awake ? 'awake' : 'sleep')) : 'DEAD '}  hp ${String(b.hp).padStart(5)}/${b.maxHp}  shields ${b.shields}/${b.maxShields}  turrets ${b.turrets}  army ${b.army}`));
+  $('info').innerHTML = lines.join('\n');
+}
+
+function resize() { renderer.setSize(innerWidth, innerHeight, false); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+let last = performance.now(), fpsAcc = 0, fpsN = 0, fpsTxt = '';
+function frame(now) {
+  requestAnimationFrame(frame);
+  const rdt = Math.min((now - last) / 1000, 0.05); last = now;
+  fpsAcc += rdt; fpsN++; if (fpsAcc > 1) { fpsTxt = Math.round(fpsN / fpsAcc) + ' fps'; fpsAcc = 0; fpsN = 0; }
+  const n = Math.max(1, Math.ceil(timeScale)); for (let i = 0; i < n; i++) step(rdt * timeScale / n);
+  if (msgT > 0) { msgT -= rdt; if (msgT <= 0) $('msg').textContent = ''; }
+  shipMesh.position.copy(player.pos); shipMesh.lookAt(player.pos.clone().add(player.vel));
+  partCloud.begin(); for (const p of parts) { const f = p.life / p.max; partCloud.add(p.x, p.y, p.z, f, (0.4 + p.hot * 0.6) * f, p.hot * 0.4 * f); } partCloud.end();
+  bulCloud.begin(); for (const b of pBul) bulCloud.add(b.p.x, b.p.y, b.p.z, .4, 1, 1); for (const b of eBul) bulCloud.add(b.p.x, b.p.y, b.p.z, 1, .5, .2); bulCloud.end();
+  updateCam(rdt, now / 1000);
+  renderer.render(scene, cam);
+  drawOverlay();
+}
+requestAnimationFrame(frame);
+</script>
+</body></html>

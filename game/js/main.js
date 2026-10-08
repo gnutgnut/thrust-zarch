@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { buildLevel } from './level.js';
 import { buildCaveMesh, makeTurret, makeTank, makePod, makeRope } from './cave3d.js';
 import { Sfx } from './audio.js';
+import { createArmies } from './armies.js';
 import { settings, onSettings, createDynRes, createFrameLimiter, createPerfOverlay, createSettingsMenu, runBenchmark } from './settings.js';
 
 const $ = id => document.getElementById(id);
@@ -133,7 +134,7 @@ function explode(arr, x, y, z, n, sp, is2d) {
 }
 
 // ---------------------------------------------------------------- game state
-const G = { state: 'title', mode: 'zarch', score: 0, hi: 0, lives: 3, fuel: 100, visit: 0, tr: null, msgT: 0, over: false };
+const G = { hull: 100, homeHp: 100, state: 'title', mode: 'zarch', score: 0, hi: 0, lives: 3, fuel: 100, visit: 0, tr: null, msgT: 0, over: false };
 try { G.hi = +(localStorage.getItem('tz_hi') || 0); } catch (e) {}
 function addScore(n) { G.score += n; if (G.score > G.hi) { G.hi = G.score; try { localStorage.setItem('tz_hi', G.hi); } catch (e) {} } }
 function say(t, secs = 2) { const m = $('msg'); m.textContent = t; m.style.opacity = t ? 1 : 0; G.msgT = secs; }
@@ -254,36 +255,34 @@ const reticle = new THREE.Group();
 }
 const aimLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xff4466, transparent: true, opacity: 0.5, depthTest: false }));
 aimLine.renderOrder = 10; zScene.add(aimLine);
-const zParts = [], zBullets = [], enemies = [];
+const zParts = [], zBullets = [];
 const zPartCloud = new Cloud(zScene, 1600, 1.1, true), zBulCloud = new Cloud(zScene, 400, 2.2, true);
 const Z = {
   pos: new THREE.Vector3(0, PAD_H + 0.9, 6.5), vel: new THREE.Vector3(), lean: new THREE.Vector2(), facing: new THREE.Vector2(0, -1),
   aim: new THREE.Vector3(0, 0, -1), hd: 0, throttle: 0, landed: true, alive: true, deadT: 0, fireCd: 0, wave: 0, waveT: 2,
 };
-const enemyMat = new THREE.MeshPhongMaterial({ color: 0xdd2222, emissive: 0x440808, flatShading: true });
-const enemyRing = new THREE.MeshBasicMaterial({ color: 0xff8844 });
-function spawnEnemy() {
-  const a = rnd(Math.PI * 2), d = rnd(130, 220);
-  const x = clamp(Z.pos.x + Math.cos(a) * d, -BOUND, BOUND), zz = clamp(Z.pos.z + Math.sin(a) * d, -BOUND, BOUND);
-  const g = new THREE.Group();
-  g.add(new THREE.Mesh(new THREE.OctahedronGeometry(1.8).scale(1.4, 0.7, 1.4), enemyMat));
-  g.add(new THREE.Mesh(new THREE.TorusGeometry(2.6, 0.12, 4, 20).rotateX(Math.PI / 2), enemyRing));
-  g.position.set(x, groundY(x, zz) + 28, zz); zScene.add(g);
-  enemies.push({ mesh: g, vel: new THREE.Vector3(), fireT: rnd(1, 3), ph: rnd(6.28), hp: 1 });
+const armies = createArmies({
+  scene: zScene, groundY, terrainH, BOUND, PAD_H, rnd, say, addScore, sfx,
+  spawnBullet: b => zBullets.push(b),
+  explode: (p, k) => { explode(zParts, p.x, p.y, p.z, Math.round(20 + k * 30), 10 + k * 6, false); sfx.boom(Math.min(2, 0.5 + k * 0.4)); },
+  homeHit: dmg => { G.homeHp = Math.max(0, G.homeHp - dmg * 4); },
+});
+armies.setDifficulty(0.7);
+const playerRef = { pos: null, vel: null, alive: true, ram: why => killPlayerZ(why) };
+// hull: enemy fire chips it away; landing on the pad repairs it along with the refuel
+function damagePlayer(dmg, why) {
+  if (G.bench || !Z.alive) return;
+  G.hull -= 22 * (dmg || 1); sfx.hit?.();
+  if (G.hull <= 0) killPlayerZ(why);
 }
-function clearEnemies() { for (const e of enemies) zScene.remove(e.mesh); enemies.length = 0; }
 function resetZarch(fromPad) {
   Z.pos.set(0, PAD_H + (fromPad ? 0.9 : 2.5), 6.5); Z.vel.set(0, fromPad ? 0 : 14, 0); Z.lean.set(0, 0); Z.landed = fromPad;
   Z.alive = true; shipMesh.visible = true; shipShadow.visible = true; zBullets.length = 0;
-  for (const e of enemies) {
-    const dx = e.mesh.position.x, dz = e.mesh.position.z, d = Math.hypot(dx, dz);
-    if (d < 90) { const k = 110 / Math.max(d, 1); e.mesh.position.x = dx * k; e.mesh.position.z = dz * k; }
-  }
 }
 function killPlayerZ(why) {
   if (G.bench) return;
   if (!Z.alive) return;
-  Z.alive = false; Z.deadT = 2.4; shipMesh.visible = false; shipShadow.visible = false;
+  Z.alive = false; Z.deadT = 2.4; G.hull = 100; shipMesh.visible = false; shipShadow.visible = false;
   explode(zParts, Z.pos.x, Z.pos.y, Z.pos.z, 120, 28, false); sfx.boom(1.2); sfx.engine(0);
   say(why, 2);
   G.lives--; if (G.lives < 0) gameOver();
@@ -291,10 +290,6 @@ function killPlayerZ(why) {
 
 function updateZarch(dt, inp) {
   const P = Z.pos;
-  if (enemies.length === 0) {
-    Z.waveT -= dt;
-    if (Z.waveT <= 0) { Z.wave++; const n = Math.min(2 + Z.wave, 9); for (let i = 0; i < n; i++) spawnEnemy(); Z.waveT = 3; say('WAVE ' + Z.wave, 1.5); sfx.waveStart?.(Z.wave); }
-  }
   let lm = 0;
   if (!Z.alive) {
     Z.deadT -= dt;
@@ -355,39 +350,19 @@ function updateZarch(dt, inp) {
     let dead = b.life <= 0 || b.p.y < groundY(b.p.x, b.p.z);
     if (dead && b.life > 0) explode(zParts, b.p.x, b.p.y, b.p.z, 6, 6, false);
     if (!dead && b.own) {
-      for (const e of enemies) if (e.mesh.position.distanceTo(b.p) < 3.6) { e.hp--; dead = true; break; }
-    } else if (!dead && !b.own && Z.alive && b.p.distanceTo(P) < 2.1) { dead = true; killPlayerZ('SHOT DOWN'); }
+      if (armies.hitTest(b.p, 0.6, 1)) dead = true;
+    } else if (!dead && !b.own && Z.alive && b.p.distanceTo(P) < 2.1) { dead = true; damagePlayer(b.dmg, 'SHOT DOWN'); }
     if (dead) { zBullets[i] = zBullets[zBullets.length - 1]; zBullets.pop(); }
   }
-  for (let i = enemies.length - 1; i >= 0; i--) {
-    const e = enemies[i], ep = e.mesh.position; e.ph += dt;
-    if (e.hp <= 0) {
-      explode(zParts, ep.x, ep.y, ep.z, 70, 22, false); sfx.boom(0.8); addScore(150);
-      zScene.remove(e.mesh); enemies.splice(i, 1); continue;
-    }
-    const tx = Z.alive ? P.x : 0, tz = Z.alive ? P.z : 0;
-    const dx = tx - ep.x, dz = tz - ep.z, hd = Math.hypot(dx, dz) || 1, sp = 15 + Z.wave * 1.2;
-    const near = hd < 40 ? -1 : 1;
-    const wantV = new THREE.Vector3((dx / hd) * sp * near + Math.cos(e.ph * 1.3) * 5, 0, (dz / hd) * sp * near + Math.sin(e.ph * 1.1) * 5);
-    wantV.y = (groundY(ep.x, ep.z) + 26 + Math.sin(e.ph) * 5 - ep.y) * 1.2;
-    e.vel.lerp(wantV, 1 - Math.exp(-1.5 * dt)); ep.addScaledVector(e.vel, dt);
-    ep.x = clamp(ep.x, -BOUND, BOUND); ep.z = clamp(ep.z, -BOUND, BOUND);
-    e.mesh.rotation.y += dt * 2;
-    e.fireT -= dt;
-    if (Z.alive && e.fireT <= 0 && hd < 100) {
-      e.fireT = Math.max(0.9, 2.6 - Z.wave * 0.12) + rnd(1); sfx.enemyShot();
-      const t = ep.distanceTo(P) / 48, aim = P.clone().addScaledVector(Z.vel, t * 0.5);
-      aim.x += rnd(-5, 5); aim.z += rnd(-5, 5);
-      zBullets.push({ p: ep.clone(), v: aim.sub(ep).normalize().multiplyScalar(48), life: 3, own: false });
-    }
-    if (Z.alive && ep.distanceTo(P) < 3.2) { e.hp = 0; killPlayerZ('RAMMED'); }
-  }
+  playerRef.pos = Z.pos; playerRef.vel = Z.vel; playerRef.alive = Z.alive;
+  armies.update(dt, playerRef);
   stepParts(zParts, dt);
 }
 
 function refuelAtBase() {
   sfx.dock(); sfx.engine(0);
-  if (G.fuel < 99) { say('REFUELLED', 1.5); sfx.refuel?.(); }
+  if (G.fuel < 99 || G.hull < 100) { say('REFUELLED + REPAIRED', 1.5); sfx.refuel?.(); }
+  G.hull = 100;
   G.fuel = 100;
 }
 
@@ -556,7 +531,7 @@ function gameOver() {
 function startTransition(label, swap) { G.state = 'trans'; G.tr = { t: 0, phase: 0, swap }; $('fadeText').textContent = label; }
 function newGame() {
   G.score = 0; G.lives = 3; G.fuel = 100; G.visit = 0; G.mode = 'zarch'; G.over = false; G.state = 'play';
-  clearEnemies(); Z.wave = 0; Z.waveT = 2; zParts.length = 0; resetZarch(false); Z.pos.y = PAD_H + 30; Z.vel.set(0, 0, 0); Z.throttle = GRAV / THRUST; Z.assist = true;
+  armies.reset((Math.random() * 1e9) | 0); G.hull = 100; G.homeHp = 100; zParts.length = 0; resetZarch(false); Z.pos.y = PAD_H + 30; Z.vel.set(0, 0, 0); Z.throttle = GRAV / THRUST; Z.assist = true;
   $('title').style.display = 'none'; $('title').querySelector('h1').textContent = 'THRUST / ZARCH'; say('');
 }
 function pressStart() { if (G.state === 'title') newGame(); }
@@ -583,7 +558,13 @@ function drawMap() {
   radar.beginPath(); radar.arc(bx, by, bigMap ? 3 : 2, 0, 6.283); radar.fill();
   if (bigMap) { radar.font = '14px monospace'; radar.fillText('REFUEL / BASE', bx + 14, by + 5); }
   if (pinned) { radar.font = 'bold 9px monospace'; radar.fillText('F', bx - 3, by + 3); }
-  for (const e of enemies) dot(e.mesh.position.x, e.mesh.position.z, '#f44', bigMap ? 6 : 4);
+  for (const c of armies.contacts()) {
+    if (c.kind !== 'base') { dot(c.x, c.z, c.color, bigMap ? c.size + 2 : Math.max(2, c.size * 0.8)); continue; }
+    const X = px(c.x), Y = py(c.z), sz = (bigMap ? 2.2 : 1) * (4 + c.size), off = Math.hypot(X - cx, Y - cy) > lim;
+    if (off && !bigMap) continue;
+    radar.strokeStyle = c.critical && (performance.now() % 400 < 200) ? '#fff' : c.color; radar.lineWidth = 2; radar.strokeRect(X - sz / 2, Y - sz / 2, sz, sz);
+    if (bigMap) { radar.fillStyle = c.color; radar.font = '12px monospace'; radar.fillText(String(c.tier || '').toUpperCase(), X + sz / 2 + 4, Y + 4); }
+  }
   for (const b of zBullets) if (!b.own) dot(b.p.x, b.p.z, '#fa4', 2);
   // player: triangle pointing along the nose
   const X = px(Z.pos.x), Y = py(Z.pos.z), fx = Z.facing.x, fz = Z.facing.y, sz = bigMap ? 8 : 5;
@@ -599,7 +580,7 @@ function updateHud() {
   $('radar').style.display = G.mode === 'zarch' ? 'block' : 'none';
   if (G.mode === 'zarch') {
     const alt = Z.pos.y - 0.9 - groundY(Z.pos.x, Z.pos.z), bd = Math.hypot(Z.pos.x, Z.pos.z);
-    $('alt').textContent = `ALT ${alt.toFixed(0)}m  VS ${Z.vel.y.toFixed(1)}  BASE ${bd.toFixed(0)}m`;
+    $('alt').textContent = `HULL ${Math.max(0, G.hull).toFixed(0)}%  ALT ${alt.toFixed(0)}m  VS ${Z.vel.y.toFixed(1)}  BASE ${bd.toFixed(0)}m${G.homeHp < 100 ? `  HOME ${G.homeHp.toFixed(0)}%` : ''}`;
     $('hint').textContent = bd < 60 && !Z.landed ? 'LAND ON THE PAD TO REFUEL  -  DIVE INTO THE SHAFT FOR THE CAVE' : '';
     drawMap();
   } else {
@@ -627,6 +608,7 @@ const menu = createSettingsMenu({
 function applySettings(s, path) {
   const all = path === '*';
   if (all || path.startsWith('world.drawDistance') || path.startsWith('world.terrainDetail')) rebuildTerrain();
+  if (all || path.startsWith('world.drawDistance')) armies.setDrawDistance(s.world.drawDistance);
   if (all || path === 'world.trees') if (treeMesh) treeMesh.count = Math.round(treeTotal * s.world.trees);
   if (all || path.startsWith('audio')) { sfx.setVolume?.({ master: s.audio.master, music: s.audio.music, sfx: s.audio.sfx }); sfx.setQuality?.(s.audio.audioQuality); }
   $('dbg').style.display = s.display.showFps ? 'none' : '';
@@ -701,6 +683,7 @@ function updateCamsAndMeshes(dt, time) {
   const dd = settings.world.drawDistance, fogFar = lerp(dd, Math.max(dd, 170), e);
   zScene.fog.color.copy(HORIZON).multiplyScalar(1 - 0.85 * e); zScene.fog.near = lerp(dd * 0.45, 120, e); zScene.fog.far = fogFar;
   if (Math.abs(zCam.far - fogFar * 1.15) > 1) { zCam.far = fogFar * 1.15; zCam.updateProjectionMatrix(); }
+  sky.scale.setScalar(fogFar * 1.1 / 900);   // keep the sky dome inside the shortened far plane
   terrain.material.uniforms.uFogNear.value = zScene.fog.near; terrain.material.uniforms.uFogFar.value = zScene.fog.far;
   sky.position.copy(zCam.position);
   terrain.position.set(Math.round(zCam.position.x / TG) * TG, 0, Math.round(zCam.position.z / TG) * TG);
@@ -766,7 +749,7 @@ function frame(now) {
   } else if (G.state === 'title') { stepParts(zParts, dt); }
   updateCamsAndMeshes(dt, now / 1000);
   sfx.setMood?.(smooth(0, 1, camB));
-  sfx.setIntensity?.(G.mode === 'zarch' ? clamp(enemies.length / 8, 0, 1) : clamp(T.tb.length / 4 + (T.pod && T.pod.attached ? 0.4 : 0), 0, 1));
+  sfx.setIntensity?.(G.mode === 'zarch' ? armies.intensity() : clamp(T.tb.length / 4 + (T.pod && T.pod.attached ? 0.4 : 0), 0, 1));
   if (G.state === 'play' && !menuPaused && G.fuel < 15 && G.fuel > 0) sfx.alarm?.();
   if (menuPaused || G.state !== 'play') sfx.beam?.(false);
   updateHud();
@@ -777,7 +760,7 @@ function frame(now) {
 buildCave(1); resetZarch(true);
 fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(v => { if (v) $('gpuinfo').textContent += `  ·  build ${v.commit}${v.dirty ? '+' : ''} ${v.date}`; }).catch(() => {});
 requestAnimationFrame(frame);
-if (params.has('debug')) { window.__G = { G, Z, T, settings, menu, benchHooks, runBenchmark, newGame, enemies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
+if (params.has('debug')) { window.__G = { G, Z, T, settings, menu, benchHooks, runBenchmark, newGame, armies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
     newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); G.icon = true; camB = 1;
     T.x = 10.2; T.y = 26.4; T.ang = -0.3; T.vx = T.vy = 0; T.thrOn = 1; T.beamOn = true; T.face = 1; T.roll = 0;
     Object.assign(T.pod, { x: 12.2, y: 21.9, attached: true, len: 4.2 }); G.state = 'icon';
