@@ -15,7 +15,7 @@
     "notblank 0.05",
     "waitFor 8000 __G.G.mode==='thrust' && __G.camB > 0.99",
     "eval ({T:{x:__G.T.x,y:__G.T.y,alive:__G.T.alive}, fps:document.getElementById('dbg').textContent})",
-    "eval (__G.T.y = __G.T.lvl.H + 0.5, __G.T.vy = 8, 1)",
+    "eval (__G.T.y = __G.T.lvl.H + 0.5, __G.T.vy = 8, __G.T.landed = false, 1)",
     "waitFor 3000 __G.G.mode==='zarch'",
     "wait 600",
     "shot exitswing",
