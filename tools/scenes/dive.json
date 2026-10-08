@@ -1,0 +1,26 @@
+{
+  "name": "dive",
+  "query": "?debug&auto&kb",
+  "steps": [
+    "waitFor 10000 window.__G && __G.G.state==='play'",
+    "wait 800",
+    "expect __G.Z.alive && Math.abs(__G.Z.vel.y) < 3",
+    "shot hover",
+    "eval (__G.Z.assist=false, __G.Z.pos.set(0,14,1), __G.Z.vel.set(0,-6,0), 1)",
+    "waitFor 4000 __G.G.mode==='thrust'",
+    "wait 400",
+    "shot swing",
+    "wait 1400",
+    "shot cave",
+    "notblank 0.05",
+    "expect __G.G.mode==='thrust' && __G.camB > 0.99",
+    "eval ({T:{x:__G.T.x,y:__G.T.y,alive:__G.T.alive}, fps:document.getElementById('dbg').textContent})",
+    "eval (__G.T.y = __G.T.lvl.H + 0.5, __G.T.vy = 8, 1)",
+    "waitFor 3000 __G.G.mode==='zarch'",
+    "wait 600",
+    "shot exitswing",
+    "wait 1200",
+    "shot surface",
+    "expect __G.G.mode==='zarch' && __G.camB < 0.01"
+  ]
+}

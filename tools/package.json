@@ -1,0 +1,13 @@
+{
+  "name": "thrust-zarch-tools",
+  "private": true,
+  "type": "module",
+  "description": "Headless browser oracle harness for the Thrust/Zarch game",
+  "scripts": {
+    "smoke": "node snap.mjs scenes/smoke.json",
+    "cave": "node snap.mjs scenes/cave.json"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.13.0"
+  }
+}

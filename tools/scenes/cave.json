@@ -1,0 +1,12 @@
+{
+  "name": "cave",
+  "query": "?debug&thrust",
+  "steps": [
+    "waitFor 10000 window.__G && __G.G.mode==='thrust'",
+    "wait 1500",
+    "shot cave",
+    "notblank 0.02",
+    "expect __G.G.mode==='thrust'",
+    "eval ({mode:__G.G.mode, state:__G.G.state, fps:document.getElementById('dbg').textContent})"
+  ]
+}

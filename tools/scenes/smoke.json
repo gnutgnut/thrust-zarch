@@ -1,0 +1,21 @@
+{
+  "name": "smoke",
+  "query": "?debug&auto",
+  "steps": [
+    "waitFor 10000 window.__G && __G.G.state==='play'",
+    "wait 1500",
+    "shot landscape",
+    "notblank 0.05",
+    "expect __G.G.mode==='zarch'",
+    "eval ({mode:__G.G.mode, state:__G.G.state, pos:__G.Z.pos.toArray(), alive:__G.Z.alive, landed:__G.Z.landed, gpu:document.getElementById('gpuinfo').textContent, fps:document.getElementById('dbg').textContent})",
+    "log ?debug&auto drops the ship from PAD_H+30; untouched it crashes on the pad, and lifting off the pad re-docks at once. So park it at rest in the air (y=36) via the bridge, then thrust.",
+    "waitFor 10000 __G.Z.alive && __G.G.state==='play' && __G.G.mode==='zarch'",
+    "eval (__G.Z.pos.y = 36, __G.Z.vel.set(0,0,0), __G.Z.landed = false, window.__y0 = __G.Z.pos.y)",
+    "key hold Space 1000",
+    "eval ({y0: window.__y0, y1: __G.Z.pos.y, vy: __G.Z.vel.y, throttle: __G.Z.throttle, lives: __G.G.lives, fuel: __G.G.fuel})",
+    "shot after-thrust",
+    "notblank 0.05",
+    "expect __G.G.mode==='zarch'",
+    "expect __G.Z.pos.y > window.__y0 + 1"
+  ]
+}

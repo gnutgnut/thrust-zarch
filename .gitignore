@@ -3,3 +3,7 @@ universal-modder-src/
 node_modules/
 .DS_Store
 Thumbs.db
+
+# oracle harness (tools/)
+tools/node_modules/
+tools/runs/
