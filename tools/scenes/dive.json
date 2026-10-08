@@ -17,6 +17,7 @@
     "eval ({T:{x:__G.T.x,y:__G.T.y,alive:__G.T.alive}, fps:document.getElementById('dbg').textContent})",
     "eval (__G.T.y = __G.T.lvl.H + 0.5, __G.T.vy = 8, __G.T.landed = false, 1)",
     "waitFor 3000 __G.G.mode==='zarch'",
+    "eval (__G.Z.pos.z = 12, __G.Z.assist = true, 1)",
     "wait 600",
     "shot exitswing",
     "wait 1200",
