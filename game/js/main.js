@@ -143,9 +143,9 @@ function say(t, secs = 2) { const m = $('msg'); m.textContent = t; m.style.opaci
 const PAD_H = 6, BASE_R = 18, GRAV = 9.0, THRUST = 21, MAXLEAN = 0.8, BOUND = 360;
 const rawH = (x, z) => 14 * Math.sin(x * .035 + 1.3) * Math.cos(z * .04) + 9 * Math.sin(x * .09 + z * .07) + 5 * Math.sin(z * .13 - x * .05) + 2.5 * Math.sin(x * .31) * Math.sin(z * .27) + 8;
 // The Thrust cave lives underground in the plane z = 0, centred under the base pad. CS = world units per cave cell.
-const CS = 1.6, CAVE_OX = 32.5, CAVE_DEPTH = 6, HOLE_X = 3.5 * CS, HOLE_Z = CAVE_DEPTH / 2 * CS, STRIP_X = 76, STRIP_Z = 9;
+const CS = 1.6, CAVE_TOP = PAD_H - 0.15, CAVE_OX = 32.5, CAVE_DEPTH = 6, HOLE_X = 3.5 * CS, HOLE_Z = CAVE_DEPTH / 2 * CS, STRIP_X = 76, STRIP_Z = 9;
 const stripW = (x, z) => smooth(0, 14, Math.hypot(Math.max(Math.abs(x) - STRIP_X, 0), Math.max(Math.abs(z) - STRIP_Z, 0)));
-const terrainH = (x, z) => { const h = lerp(PAD_H, rawH(x, z), smooth(BASE_R, 60, Math.hypot(x, z))); return lerp(Math.max(h, PAD_H + 1), h, stripW(x, z)); };
+const terrainH = (x, z) => { const h = lerp(PAD_H, rawH(x, z), smooth(BASE_R, 60, Math.hypot(x, z))); return lerp(Math.max(h, PAD_H), h, stripW(x, z)); };
 const inHole = (x, z) => Math.abs(x) < HOLE_X && Math.abs(z) < HOLE_Z;
 const groundY = (x, z) => inHole(x, z) ? -1e4 : Math.max(terrainH(x, z), 0);
 
@@ -173,7 +173,7 @@ const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMater
       vec4 w=modelMatrix*vec4(position,1.);
       float h=mix(${PAD_H.toFixed(1)},rawH(w.xz),smoothstep(${BASE_R.toFixed(1)},60.,length(w.xz)));
       vec2 sd=max(abs(w.xz)-vec2(${STRIP_X.toFixed(1)},${STRIP_Z.toFixed(1)}),0.);
-      h=mix(max(h,${(PAD_H + 1).toFixed(1)}),h,smoothstep(0.,14.,length(sd)));
+      h=mix(max(h,${PAD_H.toFixed(1)}),h,smoothstep(0.,14.,length(sd)));
       vRaw=h; w.y=max(h,0.); vW=w.xyz;
       gl_Position=projectionMatrix*viewMatrix*w;
     }`,
@@ -376,14 +376,14 @@ const tPartCloud = new Cloud(caveGroup, 1600, 1.0, true), tBulCloud = new Cloud(
 const podMesh = makePod(), rope = makeRope();
 const beam3 = new THREE.Mesh(new THREE.ConeGeometry(2.2, 5.8, 20, 1, true), new THREE.MeshBasicMaterial({ color: 0x66ffee, transparent: true, opacity: 0.22, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false }));
 caveGroup.add(podMesh, rope.obj, beam3);
-const caveToWorld = (x, y, out) => out.set((x - CAVE_OX) * CS, PAD_H + (y - T.lvl.H) * CS, 0);
+const caveToWorld = (x, y, out) => out.set((x - CAVE_OX) * CS, CAVE_TOP + (y - T.lvl.H) * CS, 0);
 const sol = (x, y) => { const L = T.lvl; if (x < 0 || x >= L.W || y < 0) return 1; if (y >= L.H) return 0; return L.solid[Math.floor(y) * L.W + Math.floor(x)]; };
 const isPad = (x, y) => { const L = T.lvl; if (x < 0 || x >= L.W || y < 0 || y >= L.H) return false; return L.pad[Math.floor(y) * L.W + Math.floor(x)] === 1; };
 
 function buildCave(visit) {
   const L = T.lvl = buildLevel(visit);
   if (!caveMesh) { caveMesh = buildCaveMesh(L, { depth: CAVE_DEPTH }); caveGroup.add(caveMesh); }
-  caveGroup.position.set(-CAVE_OX * CS, PAD_H - L.H * CS, 0);
+  caveGroup.position.set(-CAVE_OX * CS, CAVE_TOP - L.H * CS, 0);
   caveDyn.clear();
   T.turrets = L.turrets.map(t => ({ ...t, cd: rnd(0.5, 2), alive: true, ang: 0, mesh: null }));
   T.tanks = L.tanks.map(t => ({ ...t, mesh: null, max: t.fuel }));
@@ -397,7 +397,7 @@ function enterCave() {
   G.visit++; buildCave(G.visit);
   const L = T.lvl, P = Z.pos;
   G.mode = 'thrust';
-  T.x = P.x / CS + CAVE_OX; T.y = (P.y - PAD_H) / CS + L.H; T.vx = Z.vel.x / CS; T.vy = Z.vel.y / CS;
+  T.x = P.x / CS + CAVE_OX; T.y = (P.y - CAVE_TOP) / CS + L.H; T.vx = Z.vel.x / CS; T.vy = Z.vel.y / CS;
   T.ang = Math.atan(Z.lean.x); T.zOff = P.z; T.landed = false; T.alive = true; T.thrOn = Z.throttle;
   T.face = Z.facing.x < 0 ? -1 : 1; T.roll = T.face > 0 ? 0 : Math.PI;
   say('GRAB THE POD  -  ESCAPE UP THE SHAFT', 3);

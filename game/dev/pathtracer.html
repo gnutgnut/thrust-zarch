@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Path tracer dev</title>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.min.js"}}</script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font:13px Consolas,monospace;color:#bff}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;image-rendering:auto}
+#ui{position:fixed;left:10px;top:10px;background:rgba(0,15,25,.72);padding:8px 10px;border:1px solid #4aa;line-height:1.7;user-select:none}
+#ui label{display:block}
+#ui select,#ui input{font:inherit;background:#123;color:#cff;border:1px solid #4aa}
+#stats{color:#ff8;white-space:pre}
+#help{color:#7aa;font-size:11px}
+</style></head><body>
+<canvas id="gl"></canvas>
+<div id="ui">
+  <label>bounces <select id="bounces"><option>1</option><option selected>2</option><option>3</option><option>4</option></select>
+    spp <select id="spp"><option selected>1</option><option>2</option><option>4</option></select></label>
+  <label>scale <input id="scale" type="range" min="0.1" max="1" step="0.05" value="0.35"> <span id="scaleV"></span></label>
+  <label><input id="denoise" type="checkbox" checked> denoise <select id="dnIt"><option selected>1</option><option>2</option></select></label>
+  <label><input id="accum" type="checkbox" checked> accumulate</label>
+  <label><input id="orbit" type="checkbox" checked> auto orbit</label>
+  <label><input id="anim" type="checkbox" checked> animate objects</label>
+  <label><input id="cave" type="checkbox"> cave view</label>
+  <div id="stats"></div>
+  <div id="help">WASD/QE fly, drag to look (disables orbit)</div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { createPathTracer } from '../js/pathtracer.js';
+import { buildLevel } from '../js/level.js';
+
+const qs = new URLSearchParams(location.search), $ = id => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+const pt = createPathTracer(renderer);
+const cam = new THREE.PerspectiveCamera(62, 1, 0.5, 1200);
+const L = buildLevel(1), CS = 1.6, PAD_H = 6;
+const cw = (cx, cy, z = 0) => [(cx - 32.5) * CS, PAD_H + (cy - L.H) * CS, z];
+
+// URL overrides (for the headless harness)
+for (const k of ['bounces', 'spp']) if (qs.has(k)) $(k).value = qs.get(k);
+if (qs.has('scale')) { $('scale').min = '0.02'; $('scale').step = '0.01'; $('scale').value = qs.get('scale'); }
+if (qs.has('denoise')) { const d = +qs.get('denoise'); $('denoise').checked = d > 0; if (d > 0) $('dnIt').value = String(d); }
+if (qs.has('accum')) $('accum').checked = qs.get('accum') !== '0';
+if (qs.has('orbit')) $('orbit').checked = qs.get('orbit') !== '0';
+if (qs.has('anim')) $('anim').checked = qs.get('anim') !== '0';
+if (qs.has('cave')) $('cave').checked = qs.get('cave') !== '0';
+
+function resize() { renderer.setSize(innerWidth, innerHeight, false); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+
+// ---- free-fly camera
+const keys = new Set(); let yaw = 0, pitch = -0.3, drag = null;
+const free = { pos: new THREE.Vector3(0, 22, 45) };
+addEventListener('keydown', e => { keys.add(e.code); });
+addEventListener('keyup', e => keys.delete(e.code));
+$('gl').addEventListener('mousedown', e => { drag = [e.clientX, e.clientY]; if ($('orbit').checked) { $('orbit').checked = false; syncFree(); } });
+addEventListener('mouseup', () => drag = null);
+addEventListener('mousemove', e => { if (!drag) return; yaw -= (e.clientX - drag[0]) * 0.004; pitch = Math.max(-1.5, Math.min(1.5, pitch - (e.clientY - drag[1]) * 0.004)); drag = [e.clientX, e.clientY]; });
+if (qs.has('cam')) { const c = qs.get('cam').split(',').map(Number); free.pos.set(c[0], c[1], c[2]); yaw = c[3] || 0; pitch = c[4] ?? -0.3; $('orbit').checked = false; }
+function syncFree() { free.pos.copy(cam.position); const d = new THREE.Vector3(); cam.getWorldDirection(d); yaw = Math.atan2(-d.x, -d.z); pitch = Math.asin(d.y); }
+
+// ---- scene description
+const rgb = hex => new THREE.Color(hex).toArray(); // linear
+function shipParts(p, q, spheres, boxes, thrust) {
+  const Q = new THREE.Quaternion(...q), P = new THREE.Vector3(...p);
+  const at = (x, y, z) => new THREE.Vector3(x, y, z).applyQuaternion(Q).add(P).toArray();
+  const rot = Q.toArray();
+  boxes.push({ p: at(0, 0, 0), half: [0.75, 0.28, 1.7], rot, albedo: rgb(0xd8dde8), emit: [0, 0, 0] });
+  boxes.push({ p: at(0, -0.05, 0.7), half: [2.2, 0.07, 0.7], rot, albedo: rgb(0x4488ff), emit: [0, 0, 0] });
+  boxes.push({ p: at(0, -0.55, 0), half: [0.8, 0.06, 1.2], rot, albedo: rgb(0x333a48), emit: [0, 0, 0] });
+  spheres.push({ p: at(0, 0.35, -0.3), r: 0.5, albedo: rgb(0x66e0ff), emit: [0.02, 0.1, 0.25] });
+  if (thrust) spheres.push({ p: at(0, -1.0, 0.3), r: 0.35, albedo: [1, 1, 1], emit: [14 * thrust, 7 * thrust, 2 * thrust] });
+}
+function surfaceDesc(t) {
+  const spheres = [], boxes = [];
+  const sp = [0, 11 + Math.sin(t * 0.8) * 1.5, 6.5];
+  shipParts(sp, new THREE.Quaternion().setFromEuler(new THREE.Euler(0.15 * Math.sin(t), t * 0.3, 0.1)).toArray(), spheres, boxes, 0.8 + 0.2 * Math.sin(t * 7));
+  const cols = [[16, 4, 2], [2, 12, 4], [3, 6, 18], [14, 12, 3]];
+  for (let i = 0; i < 4; i++) {
+    const a = t * 0.6 + i * Math.PI / 2;
+    spheres.push({ p: [Math.cos(a) * 11, 10 + Math.sin(t * 1.3 + i) * 0.6, Math.sin(a) * 11], r: 0.7, albedo: [1, 1, 1], emit: cols[i].map(v => v * 2.5) });
+  }
+  for (let i = 0; i < 3; i++) { // enemies
+    const a = t * 0.2 + i * 2.1;
+    spheres.push({ p: [Math.cos(a) * 40, 30 + Math.sin(t + i) * 3, Math.sin(a) * 40 - 10], r: 1.8, albedo: rgb(0xdd2222), emit: [0.15, 0.01, 0.01] });
+  }
+  for (let i = 0; i < 6; i++) { // bullets streaming from the ship
+    const k = ((t * 1.5 + i / 6) % 1);
+    spheres.push({ p: [sp[0] + k * 30, sp[1] - k * 4, sp[2] - k * 30], r: 0.25, albedo: [1, 1, 1], emit: [6, 20, 20] });
+  }
+  return { spheres, boxes };
+}
+function caveDesc(t) {
+  const spheres = [], boxes = [];
+  const sx = 32 + Math.sin(t * 0.5) * 5, sy = 34 + Math.cos(t * 0.7) * 3;
+  const ang = Math.sin(t * 0.5) * 0.4;
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, -ang)).multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI / 2, 0)));
+  shipParts(cw(sx, sy), q.toArray(), spheres, boxes, 1);
+  spheres.push({ p: cw(L.orb.x, L.orb.y), r: 0.8 * CS, albedo: rgb(0xff55dd), emit: [3, 0.4, 2.4] });
+  for (const tr of L.turrets) spheres.push({ p: cw(tr.x, tr.y), r: 0.85 * CS, albedo: rgb(0xff4433), emit: [0.6, 0.06, 0.02] });
+  for (const tk of L.tanks) boxes.push({ p: cw(tk.x, tk.y), half: [1.3, 0.8 * CS, 0.8 * CS], rot: [0, 0, 0, 1], albedo: rgb(0x225533), emit: [0.05, 0.4, 0.1] });
+  for (let i = 0; i < 5; i++) { // bullets
+    const k = (t * 0.8 + i / 5) % 1;
+    spheres.push({ p: cw(sx + 2 + k * 16, sy + 1 + k * 2), r: 0.3, albedo: [1, 1, 1], emit: [6, 20, 20] });
+  }
+  const lc = [[[11, 23], [18, 6, 2]], [[52, 35], [2, 10, 18]], [[33, 7], [14, 14, 4]]];
+  lc.forEach(([[x, y], e], i) => spheres.push({ p: cw(x + Math.cos(t + i) * 3, y + Math.sin(t * 1.2 + i) * 2), r: 0.5, albedo: [1, 1, 1], emit: e }));
+  return { spheres, boxes };
+}
+
+const SUN = qs.has('sun') ? qs.get('sun').split(',').map(Number) : [0.5, 1, 0.3];
+// ---- loop
+let time = qs.has('t') ? +qs.get('t') : 3, last = performance.now(), ftAcc = 0, ftN = 0, ftShow = 0, orbA = 0.6;
+function settings() {
+  return {
+    scale: +$('scale').value, spp: +$('spp').value, bounces: +$('bounces').value,
+    accumulate: $('accum').checked, denoise: $('denoise').checked ? +$('dnIt').value : 0,
+  };
+}
+function place(dt) {
+  if ($('cave').checked) {
+    const c = cw(32, 30); cam.fov = 38;
+    cam.position.set(c[0], c[1], 24 * CS / 2 / Math.tan(19 * Math.PI / 180) * (30 / 24));
+    cam.quaternion.identity(); cam.updateProjectionMatrix(); return;
+  }
+  if (cam.fov !== 62) { cam.fov = 62; cam.updateProjectionMatrix(); }
+  if ($('orbit').checked) {
+    orbA += dt * 0.12;
+    cam.position.set(Math.cos(orbA) * 46, 21, Math.sin(orbA) * 46); cam.lookAt(0, 8, 0);
+  } else {
+    const f = new THREE.Vector3(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch));
+    const r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw)), sp = (keys.has('ShiftLeft') ? 60 : 20) * dt;
+    if (keys.has('KeyW')) free.pos.addScaledVector(f, sp); if (keys.has('KeyS')) free.pos.addScaledVector(f, -sp);
+    if (keys.has('KeyD')) free.pos.addScaledVector(r, sp); if (keys.has('KeyA')) free.pos.addScaledVector(r, -sp);
+    if (keys.has('KeyE')) free.pos.y += sp; if (keys.has('KeyQ')) free.pos.y -= sp;
+    cam.position.copy(free.pos); cam.lookAt(free.pos.clone().add(f));
+  }
+}
+function buildDesc() {
+  const cave = $('cave').checked;
+  const d = cave ? caveDesc(time) : surfaceDesc(time);
+  return { time, sunDir: SUN, ...d, caveOn: true, caveSolid: L.solid, cavePad: L.pad, caveW: L.W, caveH: L.H, settings: settings() };
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (window.__benchBusy) return;
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  if ($('anim').checked) time += dt;
+  place(dt);
+  pt.render(cam, buildDesc(), null);
+  ftAcc += dt; ftN++;
+  if (ftAcc > 0.5) { ftShow = ftAcc / ftN * 1000; ftAcc = 0; ftN = 0; }
+  const s = pt.stats();
+  $('scaleV').textContent = (+$('scale').value).toFixed(2);
+  $('stats').textContent = `res ${s.res[0]}x${s.res[1]}  samples ${s.samples}  ${s.accum}\n${ftShow.toFixed(1)} ms/frame (rAF)`;
+}
+requestAnimationFrame(frame);
+
+// Synchronous timing: renders `frames` frames, forcing a GPU sync after each (readPixels), returns ms/frame.
+window.__pt = pt;
+window.__bench = (opts = {}, frames = 8) => {
+  window.__benchBusy = true;
+  const gl = renderer.getContext(), px = new Uint8Array(4);
+  const st = { ...settings(), ...opts };
+  if (opts.cave !== undefined) $('cave').checked = !!opts.cave;
+  place(0);
+  const mk = () => ({ ...buildDesc(), settings: st });
+  pt.render(cam, mk(), null); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const t0 = performance.now();
+  for (let i = 0; i < frames; i++) { time += 1 / 60; pt.render(cam, mk(), null); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
+  const ms = (performance.now() - t0) / frames;
+  window.__benchBusy = false;
+  return { ms: +ms.toFixed(2), res: pt.stats().res, ...opts };
+};
+</script>
+</body></html>
