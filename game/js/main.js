@@ -687,6 +687,7 @@ function updateCamsAndMeshes(dt, time) {
     const cx = clamp(T.cam.x, hw - 10, L.W - hw + 10), cy = clamp(T.cam.y, hh - 10, L.H + 6 - hh);
     caveToWorld(cx, cy, camS.position); camS.position.z = SIDE_VIEWH / 2 / Math.tan(SIDE_FOV / 2 * Math.PI / 180);
     camS.quaternion.identity();
+    if (G.icon) { caveToWorld((T.x + T.pod.x) / 2, (T.y + T.pod.y) / 2 - 0.6, camS.position); camS.position.z = 23; }
   }
   camB = clamp(camB + (inCave ? dt : -dt) / 1.3, 0, 1);
   const e = smooth(0, 1, camB);
@@ -774,5 +775,13 @@ function frame(now) {
   perf.update(frameMs, { res: [canvas.width, canvas.height], scale: dynRes.scale, drawCalls: ri.calls, triangles: ri.triangles });
 }
 buildCave(1); resetZarch(true);
+fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(v => { if (v) $('gpuinfo').textContent += `  ·  build ${v.commit}${v.dirty ? '+' : ''} ${v.date}`; }).catch(() => {});
 requestAnimationFrame(frame);
-if (params.has('debug')) { window.__G = { G, Z, T, settings, menu, benchHooks, runBenchmark, newGame, enemies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('thrust')) { newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); } }
+if (params.has('debug')) { window.__G = { G, Z, T, settings, menu, benchHooks, runBenchmark, newGame, enemies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
+    newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); G.icon = true; camB = 1;
+    T.x = 10.2; T.y = 26.4; T.ang = -0.3; T.vx = T.vy = 0; T.thrOn = 1; T.beamOn = true; T.face = 1; T.roll = 0;
+    Object.assign(T.pod, { x: 12.2, y: 21.9, attached: true, len: 4.2 }); G.state = 'icon';
+    for (let i = 0; i < 40; i++) emit(T.parts, T.x - Math.sin(T.ang) * 0.9, T.y - Math.cos(T.ang) * 0.9, 0, rnd(-1.5, 1.5) + 4, -9 + rnd(-1.5, 1.5), 0, rnd(0.2, 0.5), 1, .6, .15, 0);
+    $('hud').style.display = 'none';
+  }
+  if (params.has('thrust')) { newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); } }
