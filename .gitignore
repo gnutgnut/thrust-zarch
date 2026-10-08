@@ -9,3 +9,4 @@ tools/node_modules/
 tools/runs/
 launcher/launcher.log
 launcher/icon-source.png
+launcher/.icon-commit
