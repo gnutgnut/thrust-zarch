@@ -3,7 +3,9 @@ import { buildLevel } from './level.js';
 import { buildCaveMesh, makeTurret, makeTank, makePod, makeRope } from './cave3d.js';
 import { Sfx } from './audio.js';
 import { createArmies } from './armies.js';
-import { settings, onSettings, createDynRes, createFrameLimiter, createPerfOverlay, createSettingsMenu, runBenchmark } from './settings.js';
+import { createPipeline, retroUniforms, retroSnapGLSL, retroizeScene, fixDisplayShader } from './render.js';
+import { createPathTracer } from './pathtracer.js';
+import { settings, setSetting, applyPreset, onSettings, createDynRes, createFrameLimiter, createPerfOverlay, createSettingsMenu, runBenchmark } from './settings.js';
 
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -76,7 +78,7 @@ function readInput() {
 
 // ---------------------------------------------------------------- renderer
 const canvas = $('gl');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });   // the retro pipeline renders low-res; MSAA would be wasted
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 {
   const gl = renderer.getContext(), ext = gl.getExtension('WEBGL_debug_renderer_info');
@@ -165,8 +167,9 @@ sky.renderOrder = -10; zScene.add(sky);
 
 let TG = 2.5;
 const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMaterial({
-  uniforms: { uFog: { value: zScene.fog.color }, uFogNear: { value: 120 }, uFogFar: { value: 380 }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
+  uniforms: { ...retroUniforms, uFog: { value: zScene.fog.color }, uFogNear: { value: 120 }, uFogFar: { value: 380 }, uSun: { value: new THREE.Vector3(.5, 1, .3) } },
   vertexShader: `
+    ${retroSnapGLSL}
     varying vec3 vW; varying float vRaw;
     float rawH(vec2 p){return 14.*sin(p.x*.035+1.3)*cos(p.y*.04)+9.*sin(p.x*.09+p.y*.07)+5.*sin(p.y*.13-p.x*.05)+2.5*sin(p.x*.31)*sin(p.y*.27)+8.;}
     void main(){
@@ -175,7 +178,7 @@ const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMater
       vec2 sd=max(abs(w.xz)-vec2(${STRIP_X.toFixed(1)},${STRIP_Z.toFixed(1)}),0.);
       h=mix(max(h,${PAD_H.toFixed(1)}),h,smoothstep(0.,14.,length(sd)));
       vRaw=h; w.y=max(h,0.); vW=w.xyz;
-      gl_Position=projectionMatrix*viewMatrix*w;
+      gl_Position=retroSnap(projectionMatrix*viewMatrix*w);
     }`,
   fragmentShader: `
     varying vec3 vW; varying float vRaw; uniform vec3 uFog; uniform vec3 uSun; uniform float uFogNear, uFogFar;
@@ -197,6 +200,7 @@ const terrain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.ShaderMater
     }`,
 }));
 terrain.frustumCulled = false; zScene.add(terrain);
+fixDisplayShader(sky.material); fixDisplayShader(terrain.material);
 // the grid follows the camera and only reaches the draw distance: short draw distance is both the retro look and the fps lever
 function rebuildTerrain() {
   const dd = settings.world.drawDistance, det = settings.world.terrainDetail;
@@ -389,6 +393,7 @@ function buildCave(visit) {
   T.tanks = L.tanks.map(t => ({ ...t, mesh: null, max: t.fuel }));
   for (const t of T.turrets) { t.mesh = makeTurret(); t.mesh.position.set(t.x, t.y, 0); caveDyn.add(t.mesh); }
   for (const t of T.tanks) { t.mesh = makeTank(); t.mesh.position.set(t.x, t.y, 0); caveDyn.add(t.mesh); }
+  retroizeScene(caveGroup);
   T.pod = { x: L.orb.x, y: L.orb.y, vx: 0, vy: 0, attached: false };
   T.bullets.length = 0; T.tb.length = 0; T.parts.length = 0; T.hadPod = false;
 }
@@ -531,7 +536,7 @@ function gameOver() {
 function startTransition(label, swap) { G.state = 'trans'; G.tr = { t: 0, phase: 0, swap }; $('fadeText').textContent = label; }
 function newGame() {
   G.score = 0; G.lives = 3; G.fuel = 100; G.visit = 0; G.mode = 'zarch'; G.over = false; G.state = 'play';
-  armies.reset((Math.random() * 1e9) | 0); G.hull = 100; G.homeHp = 100; zParts.length = 0; resetZarch(false); Z.pos.y = PAD_H + 30; Z.vel.set(0, 0, 0); Z.throttle = GRAV / THRUST; Z.assist = true;
+  armies.reset((Math.random() * 1e9) | 0); retroizeScene(armies.root); G.hull = 100; G.homeHp = 100; zParts.length = 0; resetZarch(false); Z.pos.y = PAD_H + 30; Z.vel.set(0, 0, 0); Z.throttle = GRAV / THRUST; Z.assist = true;
   $('title').style.display = 'none'; $('title').querySelector('h1').textContent = 'THRUST / ZARCH'; say('');
 }
 function pressStart() { if (G.state === 'title') newGame(); }
@@ -588,13 +593,46 @@ function updateHud() {
     $('hint').textContent = '';
   }
 }
-let pixRatio = 0;
+// PS2-demake pipeline: low-res render, bloom, dither/colour-depth, scanlines. The path tracer plugs in as an override.
+const pipeline = createPipeline(renderer, { scene: zScene, camera: zCam });
+const tracer = createPathTracer(renderer);
 function resize() {
-  const w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); zCam.aspect = w / h; zCam.updateProjectionMatrix();
+  const w = innerWidth, h = innerHeight; pipeline.resize(w, h); zCam.aspect = w / h; zCam.updateProjectionMatrix();
 }
-function applyPixelRatio(dynScale) {
-  const d = settings.display, pr = Math.min(devicePixelRatio, d.pixelRatioCap) * d.renderScale * dynScale;
-  if (Math.abs(pr - pixRatio) > 0.01) { pixRatio = pr; renderer.setPixelRatio(pr); resize(); }
+addEventListener('resize', resize); resize();
+// analytic scene description for the path tracer: ship as boxes, exhaust/bullets/blasts as lights, enemies as spheres
+const _sun = [0.5, 1, 0.3], _c = new THREE.Color();
+let ptCaveSolid = null;
+function traceDesc() {
+  const spheres = [], boxes = [], inCave = G.mode === 'thrust' && !!T.lvl, P = shipMesh.position;
+  if (shipMesh.visible) {
+    const q = shipMesh.quaternion.toArray(), k = shipMesh.scale.x;
+    boxes.push({ p: P.toArray(), half: [0.75 * k, 0.28 * k, 1.6 * k], rot: q, albedo: [0.75, 0.78, 0.85], emit: [0, 0, 0] });
+    boxes.push({ p: _wpos(0, -0.05, 0.7, k).toArray(), half: [2.2 * k, 0.07 * k, 0.7 * k], rot: q, albedo: [0.15, 0.3, 0.9], emit: [0, 0, 0] });
+    const thr = inCave ? T.thrOn : Z.throttle;
+    if (thr > 0.05) spheres.push({ p: _wpos(0, -1.3, 0, k).toArray(), r: 0.45, albedo: [1, 1, 1], emit: [22 * thr, 12 * thr, 3 * thr] });
+  }
+  if (T.lvl) {
+    const pod = T.pod, wp = caveToWorld(pod.x, pod.y, new THREE.Vector3());
+    spheres.push({ p: wp.toArray(), r: 0.8 * CS, albedo: [1, 0.33, 0.87], emit: [1.2, 0.2, 0.9] });
+  }
+  for (const b of zBullets) { if (spheres.length > 40) break; spheres.push({ p: b.p.toArray(), r: 0.35, albedo: [1, 1, 1], emit: b.own ? [4, 16, 18] : [18, 8, 2] }); }
+  if (inCave) for (const b of T.bullets.concat(T.tb)) { if (spheres.length > 48) break; spheres.push({ p: caveToWorld(b.x, b.y, new THREE.Vector3()).toArray(), r: 0.3, albedo: [1, 1, 1], emit: [16, 12, 6] }); }
+  // brightest few particles stand in for explosions
+  for (let i = zParts.length - 1, n = 0; i >= 0 && n < 6 && spheres.length < 58; i -= 25, n++) { const p = zParts[i]; const f = p.life / p.max; if (f > 0.3) spheres.push({ p: [p.x, p.y, p.z], r: 0.6, albedo: [1, 1, 1], emit: [20 * f * p.r, 20 * f * p.g, 20 * f * p.b] }); }
+  if (!inCave) for (const sh of armies.ships) {
+    if (spheres.length >= 64) break;
+    if (sh.pos.distanceToSquared(P) > 200 * 200) continue;
+    _c.set(sh.tintHex ?? 0xdd2222); spheres.push({ p: sh.pos.toArray(), r: (sh.def && sh.def.radius) || 2, albedo: [_c.r, _c.g, _c.b], emit: [0, 0, 0] });
+  }
+  if (T.lvl && !ptCaveSolid) ptCaveSolid = T.lvl.solid;
+  return { time: performance.now() / 1000, sunDir: _sun, base: true, spheres, boxes, caveOn: !!T.lvl && camB > 0.01, caveSolid: ptCaveSolid, cavePad: T.lvl ? T.lvl.pad : null, caveW: T.lvl ? T.lvl.W : 64, caveH: T.lvl ? T.lvl.H : 56, settings: settings.pathTrace };
+}
+const _wv = new THREE.Vector3();
+function _wpos(x, y, z, k) { return _wv.set(x * k, y * k, z * k).applyQuaternion(shipMesh.quaternion).add(shipMesh.position); }
+function applyRenderSettings() {
+  pipeline.setSettings(settings);
+  pipeline.setOverride(settings.pathTrace.enabled ? target => tracer.render(zCam, traceDesc(), target) : null);
 }
 
 // ---------------------------------------------------------------- settings, perf, benchmark
@@ -609,6 +647,7 @@ function applySettings(s, path) {
   const all = path === '*';
   if (all || path.startsWith('world.drawDistance') || path.startsWith('world.terrainDetail')) rebuildTerrain();
   if (all || path.startsWith('world.drawDistance')) armies.setDrawDistance(s.world.drawDistance);
+  if (all || /^(display|retro|pathTrace|world\.drawDistance)/.test(path)) applyRenderSettings();
   if (all || path === 'world.trees') if (treeMesh) treeMesh.count = Math.round(treeTotal * s.world.trees);
   if (all || path.startsWith('audio')) { sfx.setVolume?.({ master: s.audio.master, music: s.audio.music, sfx: s.audio.sfx }); sfx.setQuality?.(s.audio.audioQuality); }
   $('dbg').style.display = s.display.showFps ? 'none' : '';
@@ -733,7 +772,7 @@ function frame(now) {
   requestAnimationFrame(frame);
   if (!limiter.shouldRender(now)) return;
   const frameMs = now - last, dt = Math.min(frameMs / 1000, 0.05); last = now;
-  applyPixelRatio(dynRes.update(frameMs));
+  pipeline.setDynScale(dynRes.update(frameMs));
   fpsAcc += dt; fpsN++; if (fpsAcc > 1) { $('dbg').textContent = Math.round(fpsN / fpsAcc) + ' fps'; fpsAcc = 0; fpsN = 0; }
   const inp = readInput();
   if (inp.start && !padWasStart) { sfx.init(); pressStart(); }
@@ -753,14 +792,14 @@ function frame(now) {
   if (G.state === 'play' && !menuPaused && G.fuel < 15 && G.fuel > 0) sfx.alarm?.();
   if (menuPaused || G.state !== 'play') sfx.beam?.(false);
   updateHud();
-  renderer.render(zScene, zCam);
-  const ri = renderer.info.render;
-  perf.update(frameMs, { res: [canvas.width, canvas.height], scale: dynRes.scale, drawCalls: ri.calls, triangles: ri.triangles });
+  pipeline.render(dt);
+  const ri = pipeline.info();
+  perf.update(frameMs, { res: ri.res, scale: dynRes.scale, drawCalls: ri.drawCalls, triangles: ri.triangles });
 }
-buildCave(1); resetZarch(true);
+buildCave(1); resetZarch(true); retroizeScene(zScene);
 fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(v => { if (v) $('gpuinfo').textContent += `  ·  build ${v.commit}${v.dirty ? '+' : ''} ${v.date}`; }).catch(() => {});
 requestAnimationFrame(frame);
-if (params.has('debug')) { window.__G = { G, Z, T, settings, menu, benchHooks, runBenchmark, newGame, armies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
+if (params.has('debug')) { window.__G = { G, Z, T, settings, setSetting, applyPreset, menu, benchHooks, runBenchmark, newGame, armies, enterCave, exitCave, get camB() { return camB; } }; if (params.has('auto')) newGame(); if (params.has('icon')) {
     newGame(); Z.pos.set(0, PAD_H - 1, 0); Z.vel.set(0, -4, 0); enterCave(); G.icon = true; camB = 1;
     T.x = 10.2; T.y = 26.4; T.ang = -0.3; T.vx = T.vy = 0; T.thrOn = 1; T.beamOn = true; T.face = 1; T.roll = 0;
     Object.assign(T.pod, { x: 12.2, y: 21.9, attached: true, len: 4.2 }); G.state = 'icon';
